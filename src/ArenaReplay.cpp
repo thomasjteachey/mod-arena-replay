@@ -39,6 +39,13 @@ std::vector<Opcodes> watchList =
         MSG_MOVE_START_TURN_RIGHT,
         SMSG_SPELL_START,
         SMSG_SPELL_GO,
+        CMSG_CAST_SPELL,
+        CMSG_CANCEL_CAST,
+        SMSG_CAST_FAILED,
+        SMSG_SPELL_START,
+        SMSG_SPELL_FAILURE,
+        SMSG_SPELL_DELAYED,
+        SMSG_PLAY_SPELL_IMPACT,
         SMSG_FORCE_RUN_SPEED_CHANGE,
         SMSG_ATTACKSTART,
         SMSG_POWER_UPDATE,
@@ -48,9 +55,7 @@ std::vector<Opcodes> watchList =
         SMSG_SPELLENERGIZELOG,
         SMSG_SPELLNONMELEEDAMAGELOG,
         SMSG_ATTACKSTOP,
-        SMSG_SPELLLOGEXECUTE,
         SMSG_EMOTE,
-        SMSG_SPELL_DELAYED,
         SMSG_AI_REACTION,
         SMSG_PET_NAME_QUERY_RESPONSE,
         SMSG_CANCEL_AUTO_REPEAT,
@@ -60,7 +65,6 @@ std::vector<Opcodes> watchList =
         SMSG_FORCE_SWIM_SPEED_CHANGE,
         SMSG_GAMEOBJECT_DESPAWN_ANIM,
         SMSG_CANCEL_COMBAT,
-
         SMSG_DISMOUNTRESULT,
         SMSG_MOUNTRESULT,
         SMSG_DISMOUNT,
@@ -69,19 +73,16 @@ std::vector<Opcodes> watchList =
         SMSG_MIRRORIMAGE_DATA,
         CMSG_MESSAGECHAT,
         SMSG_MESSAGECHAT
-
-        /*
-        CMSG_CANCEL_MOUNT_AURA,
-        CMSG_ALTER_APPEARANCE
-        SMSG_SUMMON_CANCEL
-        SMSG_PLAY_SOUND
-        SMSG_PLAY_SPELL_VISUAL
-        CMSG_ATTACKSWING
-        CMSG_ATTACKSTOP
-        CMSG_CAST_SPELL
-        CMSG_CANCEL_CAST*/
 };
 
+/*
+CMSG_CANCEL_MOUNT_AURA,
+CMSG_ALTER_APPEARANCE
+SMSG_SUMMON_CANCEL
+SMSG_PLAY_SOUND
+SMSG_PLAY_SPELL_VISUAL
+CMSG_ATTACKSWING
+CMSG_ATTACKSTOP*/
 
 struct PacketRecord { uint32 timestamp; WorldPacket packet; };
 struct MatchRecord { BattlegroundTypeId typeId; uint8 arenaTypeId; uint32 mapId; std::deque<PacketRecord> packets; };
@@ -108,6 +109,11 @@ public:
 
         // ignore packet when no bg or casual games
         if (replayId > 0)
+            return true;
+
+        // ignore Skirmish arena and BGs
+        // BGs Replays doesnt load, i played a Eye of the Storm and on the replay it was trying to load different BGs (AV,WSG etc) and ending instant after load.
+        if (!bg->isRated())
             return true;
 
         // ignore packets until arena started
@@ -156,12 +162,8 @@ public:
         if (replayId == 0)
             return;
 
-        // only saves Rated arena
-        //if (!bg->isRated())
-        //    return;
-
         int32 startDelayTime = bg->GetStartDelayTime();
-        if (startDelayTime > 1000)
+        if (startDelayTime > 1000) // reduces StartTime only when watching Replay
         {
             bg->SetStartDelayTime(1000);
             bg->SetStartTime(bg->GetStartTime() + (startDelayTime - 1000));
@@ -196,15 +198,10 @@ public:
         }
     }
 
-
     void OnBattlegroundEnd(Battleground* bg, TeamId winnerTeamId) override
     {
-        // n testei se grava rated, mas provavelment s
-        //if (!bg->isRated()) // skip Skirmish Arenas
-        //    return;
-
         uint32 replayId = bg->GetReplayID();
-        //save replay when a bg ends
+        // save replay when a bg ends
         if (replayId <= 0)
         {
             saveReplay(bg);

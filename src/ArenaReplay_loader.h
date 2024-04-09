@@ -1,6 +1,6 @@
 void AddArenaReplayScripts();
 
-void Addmod_replay_arenaScripts()
+void Addmod_arena_replayScripts()
 {
     AddArenaReplayScripts();
 }

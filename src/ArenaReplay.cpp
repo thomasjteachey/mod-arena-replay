@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 
+
 std::vector<Opcodes> watchList =
 {
         SMSG_NOTIFICATION,
@@ -201,6 +202,7 @@ public:
     void OnBattlegroundEnd(Battleground* bg, TeamId winnerTeamId) override
     {
         uint32 replayId = bg->GetReplayID();
+
         // save replay when a bg ends
         if (replayId <= 0)
         {
@@ -243,6 +245,22 @@ public:
         CharacterDatabase.Execute(stmt);
 
         records.erase(it);
+
+        
+        uint32 replayfightid = 0;
+        QueryResult qResult = CharacterDatabase.Query("SELECT MAX(`id`) AS max_id FROM `character_arena_replays`");
+        if (qResult)
+        {
+            do
+            {
+                replayfightid = qResult->Fetch()[0].Get<uint32>();
+            } while (qResult->NextRow());
+        }
+        for (const auto& playerPair : bg->GetPlayers())
+        {
+            Player* player = playerPair.second;
+            ChatHandler(player->GetSession()).PSendSysMessage("Replay saved. Match ID: %u", replayfightid + 1);
+        }
     }
 };
 

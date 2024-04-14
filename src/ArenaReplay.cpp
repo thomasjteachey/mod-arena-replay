@@ -258,6 +258,7 @@ public:
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 2v2 Matches", GOSSIP_SENDER_MAIN, 1);
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 3v3 Matches", GOSSIP_SENDER_MAIN, 2);
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 5v5 Matches", GOSSIP_SENDER_MAIN, 3);
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 3v3 Solo Matches", GOSSIP_SENDER_MAIN, 6);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Replay a Match ID", GOSSIP_SENDER_MAIN, 0, "Enter the Match ID", 0, true);
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Favorite Matches", GOSSIP_SENDER_MAIN, 4);
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
@@ -280,6 +281,10 @@ public:
         case 3: // Replay 5v5 Matches
             player->PlayerTalkClass->SendCloseGossip();
             ShowLastReplays5v5(player, creature);
+            break;
+        case 6: // Replay 3v3 Solo Matches
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowLastReplays3v3solo(player, creature);
             break;
         case 4: // Saved Replays
             player->PlayerTalkClass->SendCloseGossip();
@@ -461,6 +466,26 @@ private:
         AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Back", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
     }
+    void ShowLastReplays3v3solo(Player* player, Creature* creature)
+    {
+        auto matchIds = loadLast10Replays3v3solo();
+
+        const uint32 actionOffset = GOSSIP_ACTION_INFO_DEF + 10;
+
+        if (matchIds.empty())
+        {
+            AddGossipItemFor(player, GOSSIP_ICON_TAXI, "No replays found for 3v3 solo.", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
+        }
+        else
+        {
+            for (uint32 matchId : matchIds)
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay match " + std::to_string(matchId), GOSSIP_SENDER_MAIN, actionOffset + matchId);
+            }
+        }
+        AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Back", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
+        SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
+    }
 
     std::vector<uint32> loadLast10Replays2v2()
     {
@@ -502,6 +527,24 @@ private:
     {
         std::vector<uint32> records;
         QueryResult result = CharacterDatabase.Query("SELECT id FROM character_arena_replays WHERE arenaTypeId = 5 ORDER BY id DESC LIMIT 10");
+        if (!result)
+            return records;
+
+        do {
+            Field* fields = result->Fetch();
+            if (!fields)
+                return records;
+
+            uint32 matchId = fields[0].Get<uint32>();
+            records.push_back(matchId);
+        } while (result->NextRow());
+
+        return records;
+    }
+    std::vector<uint32> loadLast10Replays3v3solo()
+    {
+        std::vector<uint32> records;
+        QueryResult result = CharacterDatabase.Query("SELECT id FROM character_arena_replays WHERE arenaTypeId = 4 ORDER BY id DESC LIMIT 10");
         if (!result)
             return records;
 

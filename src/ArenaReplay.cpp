@@ -618,7 +618,7 @@ private:
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
         sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0, bg->GetStartTime(), bg->GetArenaType(), teamId);
         player->GetSession()->SendPacket(&data);
-        handler.PSendSysMessage("Replay begins.");
+        handler.PSendSysMessage("Replay ID %u begins.", replayId);
         return true;
     }
 

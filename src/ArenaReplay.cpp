@@ -193,19 +193,6 @@ public:
             WorldPacket* myPacket = &match.packets.front().packet;
             Player* replayer = bg->GetPlayers().begin()->second;
             Opcodes myOpcode = (Opcodes)myPacket->GetOpcode();
-            if (myOpcode == SMSG_UPDATE_OBJECT)
-            {
-                
-                if (myPacket->size() > 6)
-                {
-                    if (myPacket->contents()[6] == replayer->GetGUID().GetCounter())
-                    {
-                        //myPacket->contents()[6] = 1;
-                    }
-                }
-            }
-            LOG_ERROR("test", std::to_string(myOpcode));
-            sWorld->SendServerMessage(SERVER_MSG_STRING, std::to_string(myOpcode), replayer);
             replayer->GetSession()->SendPacket(myPacket);
             match.packets.pop_front();
         }

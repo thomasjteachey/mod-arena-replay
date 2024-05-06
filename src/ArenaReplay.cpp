@@ -452,26 +452,6 @@ private:
         AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Back", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
     }
-    void ShowLastReplays3v3solo(Player* player, Creature* creature)
-    {
-        auto matchIds = loadLast10Replays3v3solo();
-
-        const uint32 actionOffset = GOSSIP_ACTION_INFO_DEF + 10;
-
-        if (matchIds.empty())
-        {
-            AddGossipItemFor(player, GOSSIP_ICON_TAXI, "No replays found for 3v3 solo.", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
-        }
-        else
-        {
-            for (uint32 matchId : matchIds)
-            {
-                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay match " + std::to_string(matchId), GOSSIP_SENDER_MAIN, actionOffset + matchId);
-            }
-        }
-        AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Back", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
-        SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
-    }
 
     std::vector<uint32> loadLast10Replays2v2()
     {

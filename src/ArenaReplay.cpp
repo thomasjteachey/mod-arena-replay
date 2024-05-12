@@ -531,7 +531,7 @@ private:
         QueryResult result = CharacterDatabase.Query("SELECT id FROM character_saved_replays WHERE character_id = " + std::to_string(playerGuid) + " and replay_id = " + std::to_string(code));
         if (!result)
         {
-            std::string query = "INSERT INTO character_saved_replays ('  " + std::to_string(playerGuid) + ", " + std::to_string(code) + "')";
+            std::string query = "INSERT INTO character_saved_replays (" + std::to_string(playerGuid) + ", " + std::to_string(code) + ")";
             CharacterDatabase.Execute(query.c_str());
         }
     }

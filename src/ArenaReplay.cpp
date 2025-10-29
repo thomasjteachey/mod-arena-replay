@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -129,6 +130,63 @@ namespace
         }
     }
 
+    uint8 HexNibble(char c)
+    {
+        if (c >= '0' && c <= '9')
+            return uint8(c - '0');
+
+        if (c >= 'a' && c <= 'f')
+            return uint8(10 + (c - 'a'));
+
+        if (c >= 'A' && c <= 'F')
+            return uint8(10 + (c - 'A'));
+
+        return 0xFF;
+    }
+
+    std::string ToHex(uint8 const* data, size_t size)
+    {
+        static constexpr char kHexDigits[] = "0123456789ABCDEF";
+        std::string encoded;
+        if (!data || size == 0)
+            return encoded;
+
+        encoded.reserve(size * 2);
+
+        for (size_t i = 0; i < size; ++i)
+        {
+            uint8 byte = data[i];
+            encoded.push_back(kHexDigits[byte >> 4]);
+            encoded.push_back(kHexDigits[byte & 0xF]);
+        }
+
+        return encoded;
+    }
+
+    std::vector<uint8> FromHex(std::string const& data)
+    {
+        std::vector<uint8> decoded;
+        if (data.size() % 2 != 0)
+            return decoded;
+
+        decoded.reserve(data.size() / 2);
+        for (size_t i = 0; i < data.size(); i += 2)
+        {
+            uint8 high = HexNibble(data[i]);
+            uint8 low = HexNibble(data[i + 1]);
+
+            if (high == 0xFF || low == 0xFF)
+            {
+                decoded.clear();
+                return decoded;
+            }
+
+            decoded.push_back((high << 4) | low);
+        }
+
+        return decoded;
+    }
+
     void SaveReplay(Battleground* bg, MatchRecord&& match)
     {
         if (!bg || match.packets.empty())
@@ -146,17 +204,12 @@ namespace
                 buffer.append(record.packet.contents(), record.packet.size());
         }
 
-        std::string blob(buffer.size(), '\0');
-        if (!blob.empty())
-            std::memcpy(blob.data(), buffer.contents(), buffer.size());
+        uint32 contentSize = uint32(buffer.size());
+        std::string encoded = ToHex(static_cast<uint8 const*>(buffer.contents()), buffer.size());
 
-        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_ARENA_REPLAYS);
-        stmt->SetData<uint32>(0, uint32(match.arenaTypeId));
-        stmt->SetData<uint32>(1, uint32(match.typeId));
-        stmt->SetData<uint32>(2, buffer.size());
-        stmt->SetString(3, blob);
-        stmt->SetData<uint32>(4, match.mapId);
-        CharacterDatabase.Execute(stmt);
+        CharacterDatabase.Execute(
+            "INSERT INTO character_arena_replays (arenaTypeId, typeId, contentSize, contents, mapId) VALUES ({}, {}, {}, '{}', {})",
+            uint32(match.arenaTypeId), uint32(match.typeId), contentSize, encoded, match.mapId);
 
         uint32 replayId = 0;
         if (QueryResult result = CharacterDatabase.Query("SELECT MAX(`id`) AS max_id FROM `character_arena_replays`"))
@@ -529,21 +582,29 @@ private:
     {
         record.arenaTypeId = uint8(fields[1].Get<uint32>());
         record.typeId = BattlegroundTypeId(fields[2].Get<uint32>());
-        fields[3].Get<uint32>();
-        std::vector<uint8> data = fields[4].Get<Binary>();
+        uint32 contentSize = fields[3].Get<uint32>();
+        std::vector<uint8> data = FromHex(fields[4].Get<std::string>());
         record.mapId = fields[5].Get<uint32>();
 
         ByteBuffer buffer;
-        buffer.append(data.data(), data.size());
+        size_t appendSize = std::min<size_t>(contentSize, data.size());
+        if (appendSize > 0)
+            buffer.append(data.data(), appendSize);
 
-        while (buffer.rpos() <= buffer.size() - 1)
+        while (buffer.rpos() < buffer.size())
         {
+            if (buffer.size() - buffer.rpos() < sizeof(uint32) + sizeof(uint32) + sizeof(uint16))
+                break;
+
             uint32 packetSize;
             uint32 packetTimestamp;
             uint16 opcode;
             buffer >> packetSize;
             buffer >> packetTimestamp;
             buffer >> opcode;
+
+            if (buffer.size() - buffer.rpos() < packetSize)
+                break;
 
             WorldPacket packet(opcode, packetSize);
             if (packetSize > 0)

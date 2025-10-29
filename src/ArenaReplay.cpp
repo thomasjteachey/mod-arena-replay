@@ -223,16 +223,16 @@ namespace
         if (!bg)
             return;
 
+        auto it = s_activeReplays.find(bg->GetInstanceID());
+        if (it == s_activeReplays.end())
+            return;
+
         int32 startDelayTime = bg->GetStartDelayTime();
         if (startDelayTime > 1000)
         {
             bg->SetStartDelayTime(1000);
             bg->SetStartTime(bg->GetStartTime() + (startDelayTime - 1000));
         }
-
-        auto it = s_activeReplays.find(bg->GetInstanceID());
-        if (it == s_activeReplays.end())
-            return;
 
         MatchRecord& match = it->second;
         if (match.packets.empty() || bg->GetPlayers().empty())

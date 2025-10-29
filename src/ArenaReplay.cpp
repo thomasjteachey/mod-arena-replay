@@ -10,7 +10,6 @@
 #include "CharacterDatabase.h"
 #include "Creature.h"
 #include "DatabaseEnv.h"
-#include "Map.h"
 #include "Opcodes.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -21,11 +20,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <deque>
 #include <memory>
-#include <utility>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace
@@ -75,20 +76,19 @@ namespace
     };
 
     std::unordered_map<uint32, std::unique_ptr<ReplayRecorder>> s_activeRecorders;
-    std::unordered_map<uint64, MatchRecord> s_loadedReplays;
+    std::unordered_map<uint32, MatchRecord> s_activeReplays;
 
     constexpr uint8 kArenaType2v2 = 2;
     constexpr uint8 kArenaType3v3 = 3;
     constexpr uint8 kArenaType5v5 = 5;
 
-    constexpr std::array<Opcodes, 7> kTrackedOpcodes =
+    constexpr std::array<Opcodes, 6> kTrackedOpcodes =
     {
         SMSG_MONSTER_MOVE,
         SMSG_MOVE_KNOCK_BACK,
         SMSG_SPELL_START,
         SMSG_SPELL_GO,
         SMSG_PLAY_SPELL_VISUAL,
-        SMSG_PLAY_SPELL_VISUAL_KIT,
         SMSG_AURA_UPDATE
     };
 
@@ -146,11 +146,15 @@ namespace
                 buffer.append(record.packet.contents(), record.packet.size());
         }
 
+        std::string blob(buffer.size(), '\0');
+        if (!blob.empty())
+            std::memcpy(blob.data(), buffer.contents(), buffer.size());
+
         CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_ARENA_REPLAYS);
         stmt->SetData<uint32>(0, uint32(match.arenaTypeId));
         stmt->SetData<uint32>(1, uint32(match.typeId));
         stmt->SetData<uint32>(2, buffer.size());
-        stmt->SetBinary(3, buffer.contentsAsVector());
+        stmt->SetString(3, blob);
         stmt->SetData<uint32>(4, match.mapId);
         CharacterDatabase.Execute(stmt);
 
@@ -166,10 +170,6 @@ namespace
         if (!bg)
             return;
 
-        uint32 replayKey = bg->GetReplayID();
-        if (replayKey == 0)
-            return;
-
         int32 startDelayTime = bg->GetStartDelayTime();
         if (startDelayTime > 1000)
         {
@@ -177,14 +177,14 @@ namespace
             bg->SetStartTime(bg->GetStartTime() + (startDelayTime - 1000));
         }
 
-        auto it = s_loadedReplays.find(replayKey);
-        if (it == s_loadedReplays.end())
+        auto it = s_activeReplays.find(bg->GetInstanceID());
+        if (it == s_activeReplays.end())
             return;
 
         MatchRecord& match = it->second;
         if (match.packets.empty() || bg->GetPlayers().empty())
         {
-            s_loadedReplays.erase(it);
+            s_activeReplays.erase(it);
 
             if (!bg->GetPlayers().empty())
                 bg->GetPlayers().begin()->second->LeaveBattleground(bg);
@@ -209,8 +209,8 @@ namespace
     std::vector<uint32> LoadRecentReplays(uint8 arenaTypeId)
     {
         std::vector<uint32> resultIds;
-        if (QueryResult result = CharacterDatabase.PQuery(
-                "SELECT id FROM character_arena_replays WHERE arenaTypeId = %u ORDER BY id DESC LIMIT 10",
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT id FROM character_arena_replays WHERE arenaTypeId = {} ORDER BY id DESC LIMIT 10",
                 uint32(arenaTypeId)))
         {
             do
@@ -230,8 +230,8 @@ namespace
     std::vector<uint32> LoadSavedReplays(uint64 playerGuid, bool ascending)
     {
         std::vector<uint32> resultIds;
-        if (QueryResult result = CharacterDatabase.PQuery(
-                "SELECT replay_id FROM character_saved_replays WHERE character_id = %u ORDER BY id %s LIMIT 29",
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT replay_id FROM character_saved_replays WHERE character_id = {} ORDER BY id {} LIMIT 29",
                 uint32(playerGuid), ascending ? "ASC" : "DESC"))
         {
             do
@@ -264,10 +264,10 @@ public:
             return true;
 
         Battleground* bg = player->GetBattleground();
-        if (!bg || !bg->IsArena())
+        if (!bg || !bg->isArena())
             return true;
 
-        if (bg->GetReplayID() != 0)
+        if (s_activeReplays.find(bg->GetInstanceID()) != s_activeReplays.end())
             return true;
 
         if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
@@ -295,10 +295,10 @@ public:
 
     void OnBattlegroundStart(Battleground* bg) override
     {
-        if (!bg || !bg->IsArena())
+        if (!bg || !bg->isArena())
             return;
 
-        if (bg->GetReplayID() != 0)
+        if (s_activeReplays.find(bg->GetInstanceID()) != s_activeReplays.end())
             return;
 
         s_activeRecorders[bg->GetInstanceID()] = std::make_unique<ReplayRecorder>(bg);
@@ -309,55 +309,21 @@ public:
         if (!bg)
             return;
 
-        if (bg->GetReplayID() == 0)
+        auto it = s_activeRecorders.find(bg->GetInstanceID());
+        if (it != s_activeRecorders.end())
         {
-            auto it = s_activeRecorders.find(bg->GetInstanceID());
-            if (it == s_activeRecorders.end())
-                return;
-
             SaveReplay(bg, it->second->Release());
             s_activeRecorders.erase(it);
-            return;
         }
 
-        s_loadedReplays.erase(bg->GetReplayID());
+        s_activeReplays.erase(bg->GetInstanceID());
     }
-};
 
-namespace
-{
-    void HandleMapUpdate(Map* map)
+    void OnBattlegroundUpdate(Battleground* bg, uint32 /*diff*/) override
     {
-        if (!map)
-            return;
-
-        Battleground* bg = map->GetBG();
-        if (!bg)
-            return;
-
         HandleReplayTick(bg);
     }
-
-#define REGISTER_ARENA_REPLAY_MAP_SCRIPT(MAP_ID)                                                 \
-    class ArenaReplayMapScript_##MAP_ID : public MapScript                                        \
-    {                                                                                            \
-    public:                                                                                      \
-        ArenaReplayMapScript_##MAP_ID() : MapScript("ArenaReplayMapScript_" #MAP_ID, MAP_ID) { } \
-                                                                                                 \
-        void OnUpdate(Map* map, uint32 /*diff*/) override                                         \
-        {                                                                                        \
-            HandleMapUpdate(map);                                                                \
-        }                                                                                        \
-    };
-
-    REGISTER_ARENA_REPLAY_MAP_SCRIPT(369); // Ring of Trials
-    REGISTER_ARENA_REPLAY_MAP_SCRIPT(370); // Blade's Edge Arena
-    REGISTER_ARENA_REPLAY_MAP_SCRIPT(562); // Ruins of Lordaeron
-    REGISTER_ARENA_REPLAY_MAP_SCRIPT(572); // Arena (Generic)
-    REGISTER_ARENA_REPLAY_MAP_SCRIPT(617); // Dalaran Sewers
-    REGISTER_ARENA_REPLAY_MAP_SCRIPT(618); // The Ring of Valor
-#undef REGISTER_ARENA_REPLAY_MAP_SCRIPT
-}
+};
 
 class ReplayGossip : public CreatureScript
 {
@@ -497,7 +463,7 @@ private:
 
     void BookmarkMatch(uint64 playerGuid, uint32 replayId)
     {
-        CharacterDatabase.PExecute("INSERT IGNORE INTO character_saved_replays (character_id, replay_id) VALUES (%u, %u)",
+        CharacterDatabase.Execute("INSERT IGNORE INTO character_saved_replays (character_id, replay_id) VALUES ({}, {})",
             uint32(playerGuid), replayId);
     }
 
@@ -505,14 +471,16 @@ private:
     {
         ChatHandler handler(player->GetSession());
 
-        if (!loadReplayDataForPlayer(player, replayId))
+        std::optional<MatchRecord> record = loadReplayData(replayId);
+        if (!record)
+        {
+            handler.PSendSysMessage("Replay data not found.");
             return false;
+        }
 
-        MatchRecord const& record = s_loadedReplays[player->GetGUID().GetCounter()];
-
-        Battleground* bg = sBattlegroundMgr->CreateNewBattleground(record.typeId,
-            GetBattlegroundBracketByLevel(record.mapId, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)),
-            record.arenaTypeId, false);
+        Battleground* bg = sBattlegroundMgr->CreateNewBattleground(record->typeId,
+            GetBattlegroundBracketByLevel(record->mapId, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)),
+            record->arenaTypeId, false);
 
         if (!bg)
         {
@@ -521,8 +489,8 @@ private:
             return false;
         }
 
-        bg->SetReplayID(player->GetGUID().GetCounter());
         player->SetPendingSpectatorForBG(bg->GetInstanceID());
+        s_activeReplays[bg->GetInstanceID()] = std::move(*record);
         bg->StartBattleground();
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
@@ -539,29 +507,22 @@ private:
         return true;
     }
 
-    bool loadReplayDataForPlayer(Player* player, uint32 matchId)
+    std::optional<MatchRecord> loadReplayData(uint32 matchId)
     {
-        QueryResult result = CharacterDatabase.PQuery(
-            "SELECT id, arenaTypeId, typeId, contentSize, contents, mapId FROM character_arena_replays WHERE id = %u",
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT id, arenaTypeId, typeId, contentSize, contents, mapId FROM character_arena_replays WHERE id = {}",
             matchId);
 
         if (!result)
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage("Replay data not found.");
-            return false;
-        }
+            return std::nullopt;
 
         Field* fields = result->Fetch();
         if (!fields)
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage("Replay data not found.");
-            return false;
-        }
+            return std::nullopt;
 
         MatchRecord record;
         deserializeMatchData(record, fields);
-        s_loadedReplays[player->GetGUID().GetCounter()] = std::move(record);
-        return true;
+        return record;
     }
 
     void deserializeMatchData(MatchRecord& record, Field* fields)
@@ -601,11 +562,5 @@ void AddArenaReplayScripts()
 {
     new ArenaReplayServerScript();
     new ArenaReplayBGScript();
-    new ArenaReplayMapScript_369();
-    new ArenaReplayMapScript_370();
-    new ArenaReplayMapScript_562();
-    new ArenaReplayMapScript_572();
-    new ArenaReplayMapScript_617();
-    new ArenaReplayMapScript_618();
     new ReplayGossip();
 }

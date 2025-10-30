@@ -112,7 +112,8 @@ namespace
             if (member->GetBgTeamId() != player->GetBgTeamId())
                 continue;
 
-            return member->GetGUID() == player->GetGUID();
+            if (member->GetGUID() == player->GetGUID())
+                return true;
         }
 
         return false;

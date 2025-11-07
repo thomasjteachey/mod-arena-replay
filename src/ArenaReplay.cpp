@@ -46,6 +46,31 @@ namespace
         std::deque<PacketRecord> packets;
     };
 
+    uint8 ResolveArenaTypeId(Battleground const* bg)
+    {
+        if (!bg)
+            return 0;
+
+        uint8 arenaType = bg->GetArenaType();
+
+        if (arenaType)
+            return arenaType;
+
+        switch (bg->GetMaxPlayersPerTeam())
+        {
+            case kArenaType2v2:
+                return kArenaType2v2;
+            case kArenaType3v3:
+                return kArenaType3v3;
+            case kArenaType5v5:
+                return kArenaType5v5;
+            default:
+                break;
+        }
+
+        return arenaType;
+    }
+
     class ReplayRecorder
     {
     public:
@@ -55,7 +80,7 @@ namespace
                 return;
 
             _match.typeId = bg->GetBgTypeID();
-            _match.arenaTypeId = bg->GetArenaType();
+            _match.arenaTypeId = ResolveArenaTypeId(bg);
             _match.mapId = bg->GetMapId();
         }
 
@@ -264,7 +289,7 @@ namespace
     {
         std::vector<uint32> resultIds;
         if (QueryResult result = CharacterDatabase.Query(
-                "SELECT id FROM character_arena_replays WHERE arenaTypeId = {} ORDER BY id DESC LIMIT 10",
+                "SELECT id FROM character_arena_replays WHERE arenaTypeId IN ({}, 0) ORDER BY id DESC LIMIT 10",
                 uint32(arenaTypeId)))
         {
             do

@@ -32,6 +32,10 @@
 
 namespace
 {
+    constexpr uint8 kArenaType2v2 = 2;
+    constexpr uint8 kArenaType3v3 = 3;
+    constexpr uint8 kArenaType5v5 = 5;
+
     struct PacketRecord
     {
         uint32 timestamp = 0;
@@ -103,10 +107,6 @@ namespace
 
     std::unordered_map<uint32, std::unique_ptr<ReplayRecorder>> s_activeRecorders;
     std::unordered_map<uint32, MatchRecord> s_activeReplays;
-
-    constexpr uint8 kArenaType2v2 = 2;
-    constexpr uint8 kArenaType3v3 = 3;
-    constexpr uint8 kArenaType5v5 = 5;
 
     constexpr std::array<Opcodes, 6> kTrackedOpcodes =
     {

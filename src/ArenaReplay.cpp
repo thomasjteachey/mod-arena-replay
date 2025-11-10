@@ -1,269 +1,221 @@
 //
-// Arena replay module using AzerothCore-friendly hooks.
+// Created by romain-p on 17/10/2021.
 //
-
+#include "ArenaReplayDatabaseConnection.h"
 #include "ArenaReplay_loader.h"
-
+#include "ArenaTeamMgr.h"
+#include "Base32.h"
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
-#include "Chat.h"
 #include "CharacterDatabase.h"
-#include "Creature.h"
-#include "DatabaseEnv.h"
+#include "Chat.h"
+#include "Config.h"
 #include "Opcodes.h"
 #include "Player.h"
-#include "ScriptMgr.h"
 #include "ScriptedGossip.h"
-#include "WorldPacket.h"
-#include "WorldSession.h"
-#include "World.h"
-
-#include <algorithm>
-#include <array>
-#include <cctype>
-#include <cstring>
-#include <deque>
-#include <memory>
-#include <optional>
-#include <string>
+#include "ScriptMgr.h"
+#include <iomanip>
 #include <unordered_map>
-#include <utility>
-#include <vector>
 
-namespace
+std::vector<Opcodes> watchList =
 {
-    constexpr uint8 kArenaType2v2 = 2;
-    constexpr uint8 kArenaType3v3 = 3;
-    constexpr uint8 kArenaType5v5 = 5;
-
-    struct PacketRecord
-    {
-        uint32 timestamp = 0;
-        WorldPacket packet;
-    };
-
-    struct MatchRecord
-    {
-        BattlegroundTypeId typeId = BattlegroundTypeId::BATTLEGROUND_AA;
-        uint8 arenaTypeId = 0;
-        uint32 mapId = 0;
-        std::deque<PacketRecord> packets;
-    };
-
-    uint8 ResolveArenaTypeId(Battleground const* bg)
-    {
-        if (!bg)
-            return 0;
-
-        uint8 arenaType = bg->GetArenaType();
-
-        if (arenaType)
-            return arenaType;
-
-        switch (bg->GetMaxPlayersPerTeam())
-        {
-            case kArenaType2v2:
-                return kArenaType2v2;
-            case kArenaType3v3:
-                return kArenaType3v3;
-            case kArenaType5v5:
-                return kArenaType5v5;
-            default:
-                break;
-        }
-
-        return arenaType;
-    }
-
-    class ReplayRecorder
-    {
-    public:
-        explicit ReplayRecorder(Battleground* bg)
-        {
-            if (!bg)
-                return;
-
-            _match.typeId = bg->GetBgTypeID();
-            _match.arenaTypeId = ResolveArenaTypeId(bg);
-            _match.mapId = bg->GetMapId();
-        }
-
-        void Record(uint32 timestamp, WorldPacket const& packet)
-        {
-            PacketRecord record;
-            record.timestamp = timestamp;
-            record.packet = WorldPacket(packet);
-            _match.packets.push_back(std::move(record));
-        }
-
-        MatchRecord Release()
-        {
-            return std::move(_match);
-        }
-
-    private:
-        MatchRecord _match;
-    };
-
-    std::unordered_map<uint32, std::unique_ptr<ReplayRecorder>> s_activeRecorders;
-    std::unordered_map<uint32, MatchRecord> s_activeReplays;
-
-    constexpr std::array<Opcodes, 6> kTrackedOpcodes =
-    {
+        SMSG_NOTIFICATION,
+        SMSG_AURA_UPDATE,
+        SMSG_WORLD_STATE_UI_TIMER_UPDATE,
+        SMSG_COMPRESSED_UPDATE_OBJECT,
+        SMSG_AURA_UPDATE_ALL,
+        SMSG_NAME_QUERY_RESPONSE,
+        SMSG_DESTROY_OBJECT,
+        MSG_MOVE_START_FORWARD,
+        MSG_MOVE_SET_FACING,
+        MSG_MOVE_HEARTBEAT,
+        MSG_MOVE_JUMP,
         SMSG_MONSTER_MOVE,
-        SMSG_MOVE_KNOCK_BACK,
+        MSG_MOVE_FALL_LAND,
+        SMSG_PERIODICAURALOG,
+        SMSG_ARENA_UNIT_DESTROYED,
+        MSG_MOVE_START_STRAFE_RIGHT,
+        MSG_MOVE_STOP_STRAFE,
+        MSG_MOVE_START_STRAFE_LEFT,
+        MSG_MOVE_STOP,
+        MSG_MOVE_START_BACKWARD,
+        MSG_MOVE_START_TURN_LEFT,
+        MSG_MOVE_STOP_TURN,
+        MSG_MOVE_START_TURN_RIGHT,
         SMSG_SPELL_START,
         SMSG_SPELL_GO,
-        SMSG_PLAY_SPELL_VISUAL,
-        SMSG_AURA_UPDATE
-    };
+        CMSG_CAST_SPELL,
+        CMSG_CANCEL_CAST,
+        SMSG_CAST_FAILED,
+        SMSG_SPELL_START,
+        SMSG_SPELL_FAILURE,
+        SMSG_SPELL_DELAYED,
+        SMSG_PLAY_SPELL_IMPACT,
+        SMSG_FORCE_RUN_SPEED_CHANGE,
+        SMSG_ATTACKSTART,
+        SMSG_POWER_UPDATE,
+        SMSG_ATTACKERSTATEUPDATE,
+        SMSG_SPELLDAMAGESHIELD,
+        SMSG_SPELLHEALLOG,
+        SMSG_SPELLENERGIZELOG,
+        SMSG_SPELLNONMELEEDAMAGELOG,
+        SMSG_ATTACKSTOP,
+        SMSG_EMOTE,
+        SMSG_AI_REACTION,
+        SMSG_PET_NAME_QUERY_RESPONSE,
+        SMSG_CANCEL_AUTO_REPEAT,
+        SMSG_UPDATE_OBJECT,
+        SMSG_FORCE_FLIGHT_SPEED_CHANGE,
+        SMSG_GAMEOBJECT_QUERY_RESPONSE,
+        SMSG_FORCE_SWIM_SPEED_CHANGE,
+        SMSG_GAMEOBJECT_DESPAWN_ANIM,
+        SMSG_CANCEL_COMBAT,
+        SMSG_DISMOUNTRESULT,
+        SMSG_MOUNTRESULT,
+        SMSG_DISMOUNT,
+        CMSG_MOUNTSPECIAL_ANIM,
+        SMSG_MOUNTSPECIAL_ANIM,
+        SMSG_MIRRORIMAGE_DATA,
+        CMSG_MESSAGECHAT,
+        SMSG_MESSAGECHAT
+};
 
-    bool IsTrackedOpcode(Opcodes opcode)
-    {
-        return std::find(kTrackedOpcodes.begin(), kTrackedOpcodes.end(), opcode) != kTrackedOpcodes.end();
+/*
+CMSG_CANCEL_MOUNT_AURA,
+CMSG_ALTER_APPEARANCE
+SMSG_SUMMON_CANCEL
+SMSG_PLAY_SOUND
+SMSG_PLAY_SPELL_VISUAL
+CMSG_ATTACKSWING
+CMSG_ATTACKSTOP*/
+
+struct PacketRecord { uint32 timestamp; WorldPacket packet; };
+struct MatchRecord { BattlegroundTypeId typeId; uint8 arenaTypeId; uint32 mapId; std::deque<PacketRecord> packets; };
+struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
+std::unordered_map<uint32, MatchRecord> records;
+std::unordered_map<uint64, MatchRecord> loadedReplays;
+std::unordered_map<uint32, uint32> bgReplayIds;
+std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
+
+class ArenaReplayServerScript : public ServerScript
+{
+public:
+    ArenaReplayServerScript() : ServerScript("ArenaReplayServerScript", {
+        SERVERHOOK_CAN_PACKET_SEND
+        }) {
     }
 
-    bool IsDesignatedRecorder(Battleground const* bg, Player const* player)
+    bool CanPacketSend(WorldSession* session, WorldPacket& packet) override
     {
-        if (!bg || !player)
-            return false;
+        if (session == nullptr || session->GetPlayer() == nullptr)
+            return true;
 
-        for (auto const& itr : bg->GetPlayers())
-        {
-            Player const* member = itr.second;
-            if (!member)
-                continue;
+        Battleground* bg = session->GetPlayer()->GetBattleground();
 
-            if (member->GetBgTeamId() != player->GetBgTeamId())
-                continue;
-
-            if (member->GetGUID() == player->GetGUID())
-                return true;
-        }
-
-        return false;
-    }
-
-    void NotifyPlayersReplaySaved(Battleground* bg, uint32 replayId)
-    {
         if (!bg)
-            return;
+            return true;
 
-        for (auto const& pair : bg->GetPlayers())
+        const bool isReplay = bgReplayIds.find(bg->GetInstanceID()) != bgReplayIds.end();
+
+        // ignore packet when no bg or casual games
+        if (isReplay)
+            return true;
+
+        // ignore packets until arena started
+        if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
+            return true;
+
+        // record packets from 1 player of each team
+        // iterate just in case a player leaves and used as reference
+        for (auto it : bg->GetPlayers())
         {
-            if (Player* player = pair.second)
-                ChatHandler(player->GetSession()).PSendSysMessage("Replay saved. Match ID: %u", replayId);
-        }
-    }
-
-    uint8 HexNibble(char c)
-    {
-        if (c >= '0' && c <= '9')
-            return uint8(c - '0');
-
-        if (c >= 'a' && c <= 'f')
-            return uint8(10 + (c - 'a'));
-
-        if (c >= 'A' && c <= 'F')
-            return uint8(10 + (c - 'A'));
-
-        return 0xFF;
-    }
-
-    std::string ToHex(uint8 const* data, size_t size)
-    {
-        static constexpr char kHexDigits[] = "0123456789ABCDEF";
-        std::string encoded;
-        if (!data || size == 0)
-            return encoded;
-
-        encoded.reserve(size * 2);
-
-        for (size_t i = 0; i < size; ++i)
-        {
-            uint8 byte = data[i];
-            encoded.push_back(kHexDigits[byte >> 4]);
-            encoded.push_back(kHexDigits[byte & 0xF]);
-        }
-
-        return encoded;
-    }
-
-    std::vector<uint8> FromHex(std::string const& data)
-    {
-        std::vector<uint8> decoded;
-        if (data.size() % 2 != 0)
-            return decoded;
-
-        decoded.reserve(data.size() / 2);
-        for (size_t i = 0; i < data.size(); i += 2)
-        {
-            uint8 high = HexNibble(data[i]);
-            uint8 low = HexNibble(data[i + 1]);
-
-            if (high == 0xFF || low == 0xFF)
+            if (it.second->GetBgTeamId() == session->GetPlayer()->GetBgTeamId())
             {
-                decoded.clear();
-                return decoded;
+                if (it.second->GetGUID() != session->GetPlayer()->GetGUID())
+                    return true;
+                else
+                    break;
             }
-
-            decoded.push_back((high << 4) | low);
         }
 
-        return decoded;
+        // ignore packets not in watch list
+        if (std::find(watchList.begin(), watchList.end(), packet.GetOpcode()) == watchList.end())
+            return true;
+
+        if (records.find(bg->GetInstanceID()) == records.end())
+            records[bg->GetInstanceID()].packets.clear();
+        MatchRecord& record = records[bg->GetInstanceID()];
+
+        uint32 timestamp = bg->GetStartTime();
+        record.typeId = bg->GetBgTypeID();
+        record.arenaTypeId = bg->GetArenaType();
+        record.mapId = bg->GetMapId();
+        // push back packet inside queue of matchId 0
+        record.packets.push_back({ timestamp, /* copy */ WorldPacket(packet) });
+        return true;
+    }
+};
+
+class ArenaReplayArenaScript : public ArenaScript {
+public:
+    ArenaReplayArenaScript() : ArenaScript("ArenaReplayArenaScript", {
+        ARENAHOOK_ON_BEFORE_CHECK_WIN_CONDITION
+        }) {
     }
 
-    void SaveReplay(Battleground* bg, MatchRecord&& match)
-    {
-        if (!bg || match.packets.empty())
-            return;
+    bool OnBeforeArenaCheckWinConditions(Battleground* const bg) override {
+        const bool isReplay = bgReplayIds.find(bg->GetInstanceID()) != bgReplayIds.end();
 
-        ByteBuffer buffer;
-        for (PacketRecord& record : match.packets)
-        {
-            uint32 packetSize = record.packet.size();
-            buffer << packetSize;
-            buffer << record.timestamp;
-            buffer << static_cast<uint16>(record.packet.GetOpcode());
+        // if isReplay then return false to exit from check condition
+        return !isReplay;
+    }
+};
 
-            if (packetSize > 0)
-                buffer.append(record.packet.contents(), record.packet.size());
-        }
-
-        uint32 contentSize = uint32(buffer.size());
-        std::string encoded = ToHex(static_cast<uint8 const*>(buffer.contents()), buffer.size());
-
-        CharacterDatabase.Execute(
-            "INSERT INTO character_arena_replays (arenaTypeId, typeId, contentSize, contents, mapId) VALUES ({}, {}, {}, '{}', {})",
-            uint32(match.arenaTypeId), uint32(match.typeId), contentSize, encoded, match.mapId);
-
-        uint32 replayId = 0;
-        if (QueryResult result = CharacterDatabase.Query("SELECT MAX(`id`) AS max_id FROM `character_arena_replays`"))
-            replayId = result->Fetch()[0].Get<uint32>();
-
-        NotifyPlayersReplaySaved(bg, replayId);
+class ArenaReplayBGScript : public BGScript
+{
+public:
+    ArenaReplayBGScript() : BGScript("ArenaReplayBGScript", {
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_UPDATE,
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_ADD_PLAYER,
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_END
+        }) {
     }
 
-    void HandleReplayTick(Battleground* bg)
+    void OnBattlegroundUpdate(Battleground* bg, uint32 /* diff */) override
     {
-        if (!bg)
+        const bool isReplay = bgReplayIds.find(bg->GetInstanceID()) != bgReplayIds.end();
+        if (!isReplay)
             return;
 
-        auto it = s_activeReplays.find(bg->GetInstanceID());
-        if (it == s_activeReplays.end())
+        if (!bg->isArena() && !sConfigMgr->GetOption<bool>("ArenaReplay.SaveBattlegrounds", true))
             return;
+
+        if (!bg->isRated() && !sConfigMgr->GetOption<bool>("ArenaReplay.SaveUnratedArenas", true))
+            return;
+
+        uint32 replayId = bgReplayIds.at(bg->GetInstanceID());
 
         int32 startDelayTime = bg->GetStartDelayTime();
-        if (startDelayTime > 1000)
+        if (startDelayTime > 1000) // reduces StartTime only when watching Replay
         {
             bg->SetStartDelayTime(1000);
             bg->SetStartTime(bg->GetStartTime() + (startDelayTime - 1000));
         }
 
+        if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
+            return;
+
+        // retrieve arena replay data
+        auto it = loadedReplays.find(replayId);
+        if (it == loadedReplays.end())
+            return;
+
         MatchRecord& match = it->second;
+
+        // if replay ends or spectator left > free arena replay data and/or kick player
         if (match.packets.empty() || bg->GetPlayers().empty())
         {
-            s_activeReplays.erase(it);
+            loadedReplays.erase(it);
 
             if (!bg->GetPlayers().empty())
                 bg->GetPlayers().begin()->second->LeaveBattleground(bg);
@@ -271,296 +223,819 @@ namespace
             return;
         }
 
+        //send replay data to spectator
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
             if (bg->GetPlayers().empty())
                 break;
 
-            Player* viewer = bg->GetPlayers().begin()->second;
-            if (!viewer)
-                break;
-
-            viewer->GetSession()->SendPacket(&match.packets.front().packet);
+            WorldPacket* myPacket = &match.packets.front().packet;
+            Player* replayer = bg->GetPlayers().begin()->second;
+            replayer->GetSession()->SendPacket(myPacket);
             match.packets.pop_front();
         }
     }
 
-    std::vector<uint32> LoadRecentReplays(uint8 arenaTypeId)
+    void OnBattlegroundAddPlayer(Battleground* bg, Player* player) override
     {
-        std::vector<uint32> resultIds;
-        if (QueryResult result = CharacterDatabase.Query(
-                "SELECT id FROM character_arena_replays WHERE arenaTypeId IN ({}, 0) ORDER BY id DESC LIMIT 10",
-                uint32(arenaTypeId)))
-        {
-            do
-            {
-                Field* fields = result->Fetch();
-                if (!fields)
-                    break;
-
-                resultIds.push_back(fields[0].Get<uint32>());
-            }
-            while (result->NextRow());
-        }
-
-        return resultIds;
-    }
-
-    std::vector<uint32> LoadSavedReplays(uint64 playerGuid, bool ascending)
-    {
-        std::vector<uint32> resultIds;
-        if (QueryResult result = CharacterDatabase.Query(
-                "SELECT replay_id FROM character_saved_replays WHERE character_id = {} ORDER BY id {} LIMIT 29",
-                uint32(playerGuid), ascending ? "ASC" : "DESC"))
-        {
-            do
-            {
-                Field* fields = result->Fetch();
-                if (!fields)
-                    break;
-
-                resultIds.push_back(fields[0].Get<uint32>());
-            }
-            while (result->NextRow());
-        }
-
-        return resultIds;
-    }
-}
-
-class ArenaReplayServerScript : public ServerScript
-{
-public:
-    ArenaReplayServerScript() : ServerScript("ArenaReplayServerScript") { }
-
-    bool CanPacketSend(WorldSession* session, WorldPacket& packet) override
-    {
-        if (!session)
-            return true;
-
-        Player* player = session->GetPlayer();
         if (!player)
-            return true;
+            return;
 
-        Battleground* bg = player->GetBattleground();
-        if (!bg || !bg->isArena())
-            return true;
+        if (player->IsSpectator())
+            return;
 
-        if (s_activeReplays.find(bg->GetInstanceID()) != s_activeReplays.end())
-            return true;
+        if (!bg->isArena() && !sConfigMgr->GetOption<bool>("ArenaReplay.SaveBattlegrounds", true))
+            return;
 
-        if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
-            return true;
+        if (!bg->isRated() && !sConfigMgr->GetOption<bool>("ArenaReplay.SaveUnratedArenas", true))
+            return;
 
-        if (!IsTrackedOpcode(static_cast<Opcodes>(packet.GetOpcode())))
-            return true;
+        if (bgPlayersGuids.find(bg->GetInstanceID()) == bgPlayersGuids.end())
+        {
+            BgPlayersGuids playerguids;
+            bgPlayersGuids[bg->GetInstanceID()] = playerguids;
+        }
 
-        auto recorder = s_activeRecorders.find(bg->GetInstanceID());
-        if (recorder == s_activeRecorders.end())
-            return true;
+        std::string playerGuid = std::to_string(player->GetGUID().GetRawValue());
+        TeamId bgTeamId = player->GetBgTeamId();
 
-        if (!IsDesignatedRecorder(bg, player))
-            return true;
+        if (bgTeamId == TEAM_ALLIANCE)
+        {
+            if (!bgPlayersGuids[bg->GetInstanceID()].alliancePlayerGuids.empty())
+                bgPlayersGuids[bg->GetInstanceID()].alliancePlayerGuids += ", ";
 
-        recorder->second->Record(bg->GetStartTime(), packet);
-        return true;
+            bgPlayersGuids[bg->GetInstanceID()].alliancePlayerGuids += playerGuid;
+        }
+        else
+        {
+            if (!bgPlayersGuids[bg->GetInstanceID()].hordePlayerGuids.empty())
+                bgPlayersGuids[bg->GetInstanceID()].hordePlayerGuids += ", ";
+
+            bgPlayersGuids[bg->GetInstanceID()].hordePlayerGuids += playerGuid;
+        }
+    }
+
+    void OnBattlegroundEnd(Battleground* bg, TeamId winnerTeamId) override {
+
+        if (!bg->isArena() && !sConfigMgr->GetOption<bool>("ArenaReplay.SaveBattlegrounds", true))
+            return;
+
+        if (!bg->isRated() && !sConfigMgr->GetOption<bool>("ArenaReplay.SaveUnratedArenas", true))
+            return;
+
+        const bool isReplay = bgReplayIds.find(bg->GetInstanceID()) != bgReplayIds.end();
+
+        // only saves if arena lasted at least X secs (StartDelayTime is included - 60s StartDelayTime + X StartTime)
+        uint32 ValidArenaDuration = sConfigMgr->GetOption<uint32>("ArenaReplay.ValidArenaDuration", 75) * IN_MILLISECONDS;
+        bool ValidArena = (bg->GetStartTime()) >= ValidArenaDuration || sConfigMgr->GetOption<uint32>("ArenaReplay.ValidArenaDuration", 75) == 0;
+
+        // save replay when a bg ends
+        if (!isReplay && ValidArena)
+        {
+            saveReplay(bg, winnerTeamId);
+            return;
+        }
+
+        bgReplayIds.erase(bg->GetInstanceID());
+        bgPlayersGuids.erase(bg->GetInstanceID());
+    }
+
+    void saveReplay(Battleground* bg, TeamId winnerTeamId)
+    {
+        // retrieve replay data
+        auto it = records.find(bg->GetInstanceID());
+        if (it == records.end())
+            return;
+
+        MatchRecord& match = it->second;
+
+        /** serialize arena replay data **/
+        ArenaReplayByteBuffer buffer;
+        uint32 headerSize;
+        uint32 timestamp;
+        for (auto it : match.packets)
+        {
+            headerSize = it.packet.size(); //header 4Bytes packet size
+            timestamp = it.timestamp;
+
+            buffer << headerSize; // 4 bytes
+            buffer << timestamp; // 4 bytes
+            buffer << it.packet.GetOpcode(); // 2 bytes
+            if (headerSize > 0)
+                buffer.append(it.packet.contents(), it.packet.size()); // headerSize bytes
+        }
+
+        uint32 teamWinnerRating = 0;
+        uint32 teamLoserRating = 0;
+        uint32 teamWinnerMMR = 0;
+        uint32 teamLoserMMR = 0;
+        std::string teamWinnerName;
+        std::string teamLoserName;
+        std::string winnerGuids;
+        std::string loserGuids;
+
+        if (winnerTeamId == TEAM_ALLIANCE)
+        {
+            winnerGuids = bgPlayersGuids[bg->GetInstanceID()].alliancePlayerGuids;
+            loserGuids = bgPlayersGuids[bg->GetInstanceID()].hordePlayerGuids;
+        }
+        else
+        {
+            loserGuids = bgPlayersGuids[bg->GetInstanceID()].alliancePlayerGuids;
+            winnerGuids = bgPlayersGuids[bg->GetInstanceID()].hordePlayerGuids;
+        }
+
+        for (const auto& playerPair : bg->GetPlayers())
+        {
+            Player* player = playerPair.second;
+            if (!player || player->IsSpectator())
+                continue;
+
+            std::string playerGuid = std::to_string(player->GetGUID().GetRawValue());
+            TeamId bgTeamId = player->GetBgTeamId();
+            ArenaTeam* team = sArenaTeamMgr->GetArenaTeamById(bg->GetArenaTeamIdForTeam(bgTeamId));
+            uint32 arenaTeamId = bg->GetArenaTeamIdForTeam(bgTeamId);
+            TeamId teamId = static_cast<TeamId>(arenaTeamId);
+            uint32 teamMMR = bg->GetArenaMatchmakerRating(teamId);
+
+            if (bgTeamId == winnerTeamId)
+            {
+                getTeamInformation(bg, team, teamWinnerName, teamWinnerRating);
+                teamWinnerMMR = teamMMR;
+            }
+            else // Loss
+            {
+                getTeamInformation(bg, team, teamLoserName, teamLoserRating);
+                teamLoserMMR = teamMMR;
+            }
+
+            // Send replay ID to player after a game end
+            uint32 replayfightid = 0;
+            QueryResult qResult = CharacterDatabase.Query("SELECT MAX(`id`) AS max_id FROM `character_arena_replays`");
+            if (qResult)
+            {
+                do
+                {
+                    replayfightid = qResult->Fetch()[0].Get<uint32>();
+                } while (qResult->NextRow());
+            }
+            ChatHandler(player->GetSession()).PSendSysMessage("Replay saved. Match ID: {}", replayfightid + 1);
+        }
+
+        const uint8 ARENA_TYPE_3V3_SOLO_QUEUE = sConfigMgr->GetOption<uint8>("ArenaReplay.3v3soloQ.ArenaType", 4);
+        if (bg->isArena() && (!bg->isRated() || bg->GetArenaType() == ARENA_TYPE_3V3_SOLO_QUEUE))
+        {
+            teamWinnerName = GetTeamName(winnerGuids);
+            teamLoserName = GetTeamName(loserGuids);
+        }
+        else if (!bg->isArena())
+        {
+            teamWinnerName = "Battleground";
+            teamLoserName = "Battleground";
+        }
+
+        // // if loser has a negative value. the uint variable could return this (wrong) value
+        // if (teamLoserMMR >= 4294967286)
+        //     teamLoserMMR=0;
+
+        // if (teamWinnerMMR >= 4294967286)
+        //     teamWinnerMMR=0;
+
+        // temporary code until the issue is not properly fixed
+        teamLoserMMR = 0;
+        teamWinnerMMR = 0;
+
+        CharacterDatabase.Execute("INSERT INTO `character_arena_replays` "
+            //   1             2            3            4          5          6                  7                    8
+            "(`arenaTypeId`, `typeId`, `contentSize`, `contents`, `mapId`, `winnerTeamName`, `winnerTeamRating`, `winnerTeamMMR`, "
+            //    9                10                 11                 12                 13
+            "`loserTeamName`, `loserTeamRating`, `loserTeamMMR`, `winnerPlayerGuids`, `loserPlayerGuids`) "
+
+            "VALUES ({}, {}, {}, \"{}\", {}, '{}', {}, {}, '{}', {}, {}, \"{}\", \"{}\")",
+            //       1   2    3     4    5    6    7   8    9    10  11    12      13
+
+            uint32(match.arenaTypeId), // 1
+            uint32(match.typeId),      // 2
+            buffer.size(),             // 3
+            Acore::Encoding::Base32::Encode(buffer.contentsAsVector()), // 4
+            bg->GetMapId(),    // 5
+            teamWinnerName,    // 6
+            teamWinnerRating,  // 7
+            teamWinnerMMR,     // 8
+            teamLoserName,     // 9
+            teamLoserRating,   // 10
+            teamLoserMMR,      // 11
+            winnerGuids,       // 12
+            loserGuids         // 13
+        );
+
+        records.erase(it);
+    }
+
+private:
+    void getTeamInformation(Battleground* bg, ArenaTeam* team, std::string& teamName, uint32& teamRating) {
+        if (bg->isRated() && team)
+        {
+            if (team->GetId() < 0xFFF00000)
+            {
+                teamName = team->GetName();
+                teamRating = team->GetRating();
+            }
+        }
+    }
+
+    std::string GetTeamName(std::string listPlayerGuids) {
+        std::string teamName;
+        std::stringstream ssPlayerGuids(listPlayerGuids);
+
+        std::vector<std::string> playerGuids;
+        std::string playerGuid;
+        while (std::getline(ssPlayerGuids, playerGuid, ','))
+            playerGuids.push_back(playerGuid);
+
+        for (const std::string& guid : playerGuids)
+        {
+            uint64 _guid = std::stoi(guid);
+            CharacterCacheEntry const* playerData = sCharacterCache->GetCharacterCacheByGuid(ObjectGuid(_guid));
+            if (playerData)
+                teamName += playerData->Name + " ";
+        }
+
+        // truncate last character if space
+        if (!teamName.empty() && teamName.substr(teamName.size() - 1, teamName.size()) == " ") {
+            teamName.pop_back();
+        }
+
+        return teamName;
     }
 };
 
-class ArenaReplayBGScript : public BGScript
+enum ReplayGossips
 {
-public:
-    ArenaReplayBGScript() : BGScript("ArenaReplayBGScript") { }
-
-    void OnBattlegroundStart(Battleground* bg) override
-    {
-        if (!bg || !bg->isArena())
-            return;
-
-        if (s_activeReplays.find(bg->GetInstanceID()) != s_activeReplays.end())
-            return;
-
-        s_activeRecorders[bg->GetInstanceID()] = std::make_unique<ReplayRecorder>(bg);
-    }
-
-    void OnBattlegroundEnd(Battleground* bg, TeamId /*winnerTeamId*/) override
-    {
-        if (!bg)
-            return;
-
-        auto it = s_activeRecorders.find(bg->GetInstanceID());
-        if (it != s_activeRecorders.end())
-        {
-            SaveReplay(bg, it->second->Release());
-            s_activeRecorders.erase(it);
-        }
-
-        s_activeReplays.erase(bg->GetInstanceID());
-    }
-
-    void OnBattlegroundUpdate(Battleground* bg, uint32 /*diff*/) override
-    {
-        HandleReplayTick(bg);
-    }
+    REPLAY_LATEST_2V2 = 1,
+    REPLAY_LATEST_3V3 = 2,
+    REPLAY_LATEST_5V5 = 3,
+    REPLAY_LATEST_3V3SOLO = 4,
+    REPLAY_LATEST_1V1 = 5,
+    REPLAY_MATCH_ID = 6,
+    REPLAY_LIST_BY_PLAYERNAME = 7,
+    MY_FAVORITE_MATCHES = 8,
+    REPLAY_TOP_2V2_ALLTIME = 9,
+    REPLAY_TOP_3V3_ALLTIME = 10,
+    REPLAY_TOP_5V5_ALLTIME = 11,
+    REPLAY_TOP_3V3SOLO_ALLTIME = 12,
+    REPLAY_TOP_1V1_ALLTIME = 13,
+    REPLAY_MOST_WATCHED_ALLTIME = 14
 };
 
 class ReplayGossip : public CreatureScript
 {
 public:
-    ReplayGossip() : CreatureScript("ReplayGossip") { }
+
+    ReplayGossip() : CreatureScript("ReplayGossip") {}
 
     bool OnGossipHello(Player* player, Creature* creature) override
     {
-        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 2v2 Matches", GOSSIP_SENDER_MAIN, 1);
-        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 3v3 Matches", GOSSIP_SENDER_MAIN, 2);
-        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay 5v5 Matches", GOSSIP_SENDER_MAIN, 3);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Replay a Match ID", GOSSIP_SENDER_MAIN, 0, "Enter the Match ID", 0, true);
-        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Favorite Matches", GOSSIP_SENDER_MAIN, 4);
+        if (!sConfigMgr->GetOption<bool>("ArenaReplay.Enable", true))
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("Arena Replay disabled!");
+            return true;
+        }
+
+        const bool isArena1v1Enabled = sConfigMgr->GetOption<bool>("ArenaReplay.1v1.Enable", false);
+        const bool isArena3v3soloQEnabled = sConfigMgr->GetOption<bool>("ArenaReplay.3v3soloQ.Enable", false);
+
+        if (isArena1v1Enabled)
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 1v1 games of the last 30 days", GOSSIP_SENDER_MAIN, REPLAY_LATEST_1V1);
+
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 2v2 games of the last 30 days", GOSSIP_SENDER_MAIN, REPLAY_LATEST_2V2);
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 3v3 games of the last 30 days", GOSSIP_SENDER_MAIN, REPLAY_LATEST_3V3);
+
+        if (isArena3v3soloQEnabled)
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 3v3 Solo games of the last 30 days", GOSSIP_SENDER_MAIN, REPLAY_LATEST_3V3SOLO);
+
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 5v5 games of the last 30 days", GOSSIP_SENDER_MAIN, REPLAY_LATEST_5V5);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Replay a Match ID", GOSSIP_SENDER_MAIN, REPLAY_MATCH_ID, "", 0, true);             // maybe add command .replay 'replayID' aswell
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Replay list by player name", GOSSIP_SENDER_MAIN, REPLAY_LIST_BY_PLAYERNAME, "", 0, true); // to do: show a list, showing games with type, teamname and teamrating
+        AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "My favorite matches", GOSSIP_SENDER_MAIN, MY_FAVORITE_MATCHES);                   // To do: somehow show teamName/TeamRating/Classes (it's a different db table)
+
+        if (isArena1v1Enabled)
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 1v1 games of all time", GOSSIP_SENDER_MAIN, REPLAY_TOP_1V1_ALLTIME);
+
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 2v2 games of all time", GOSSIP_SENDER_MAIN, REPLAY_TOP_2V2_ALLTIME);
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 3v3 games of all time", GOSSIP_SENDER_MAIN, REPLAY_TOP_3V3_ALLTIME);
+
+        if (isArena3v3soloQEnabled)
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 3v3 Solo games of all time", GOSSIP_SENDER_MAIN, REPLAY_TOP_3V3SOLO_ALLTIME);
+
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay top 5v5 games of all time", GOSSIP_SENDER_MAIN, REPLAY_TOP_5V5_ALLTIME);
+
+
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay most watched games of all time", GOSSIP_SENDER_MAIN, REPLAY_MOST_WATCHED_ALLTIME);  // To Do: show arena type + watchedTimes, maybe hide team name
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
+
         return true;
     }
 
-    bool OnGossipSelect(Player* player, Creature* creature, uint32 sender, uint32 action) override
+    bool OnGossipSelect(Player* player, Creature* creature, uint32 /* sender */, uint32 action) override
     {
+        const uint8 ARENA_TYPE_1v1 = sConfigMgr->GetOption<uint8>("ArenaReplay.1v1.ArenaType", 1);
+        const uint8 ARENA_TYPE_3V3_SOLO_QUEUE = sConfigMgr->GetOption<uint8>("ArenaReplay.3v3soloQ.ArenaType", 4);
+
         player->PlayerTalkClass->ClearMenus();
+        switch (action)
+        {
+        case REPLAY_LATEST_2V2:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysLast30Days(player, creature, ARENA_TYPE_2v2);
+            break;
+        case REPLAY_LATEST_3V3:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysLast30Days(player, creature, ARENA_TYPE_3v3);
+            break;
+        case REPLAY_LATEST_5V5:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysLast30Days(player, creature, ARENA_TYPE_5v5);
+            break;
+        case REPLAY_LATEST_3V3SOLO:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysLast30Days(player, creature, ARENA_TYPE_3V3_SOLO_QUEUE);
+            break;
+        case REPLAY_LATEST_1V1:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysLast30Days(player, creature, ARENA_TYPE_1v1);
+            break;
+        case REPLAY_TOP_2V2_ALLTIME:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysAllTime(player, creature, ARENA_TYPE_2v2);
+            break;
+        case REPLAY_TOP_3V3_ALLTIME:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysAllTime(player, creature, ARENA_TYPE_3v3);
+            break;
+        case REPLAY_TOP_5V5_ALLTIME:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysAllTime(player, creature, ARENA_TYPE_5v5);
+            break;
+        case REPLAY_TOP_3V3SOLO_ALLTIME:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysAllTime(player, creature, ARENA_TYPE_3V3_SOLO_QUEUE);
+            break;
+        case REPLAY_TOP_1V1_ALLTIME:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowReplaysAllTime(player, creature, ARENA_TYPE_1v1);
+            break;
+        case REPLAY_MOST_WATCHED_ALLTIME:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowMostWatchedReplays(player, creature);
+            break;
+        case MY_FAVORITE_MATCHES:
+            player->PlayerTalkClass->SendCloseGossip();
+            ShowSavedReplays(player, creature);
+            break;
+        case GOSSIP_ACTION_INFO_DEF: // "Back"
+            OnGossipHello(player, creature);
+            break;
+
+        default:
+            if (action >= GOSSIP_ACTION_INFO_DEF + 30) // Replay selected arenas (intid >= 30)
+                return replayArenaMatch(player, action - (GOSSIP_ACTION_INFO_DEF + 30));
+        }
+
+        return true;
+    }
+
+    bool OnGossipSelectCode(Player* player, Creature* /* creature */, uint32 /* sender */, uint32 action, const char* code) override
+    {
+        if (!code)
+        {
+            CloseGossipMenuFor(player);
+            return false;
+        }
+
+        // Forbidden: ', %, and , (' causes crash when using 'Replay list by player name')
+        std::string inputCode = std::string(code);
+        if (inputCode.find('\'') != std::string::npos ||
+            inputCode.find('%') != std::string::npos ||
+            inputCode.find(',') != std::string::npos ||
+            inputCode.length() > 50 ||
+            inputCode.empty())
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Invalid input.");
+            CloseGossipMenuFor(player);
+            return false;
+        }
 
         switch (action)
         {
-            case 1:
-                player->PlayerTalkClass->SendCloseGossip();
-                ShowReplayList(player, creature, LoadRecentReplays(kArenaType2v2));
-                break;
-            case 2:
-                player->PlayerTalkClass->SendCloseGossip();
-                ShowReplayList(player, creature, LoadRecentReplays(kArenaType3v3));
-                break;
-            case 3:
-                player->PlayerTalkClass->SendCloseGossip();
-                ShowReplayList(player, creature, LoadRecentReplays(kArenaType5v5));
-                break;
-            case 4:
-                player->PlayerTalkClass->SendCloseGossip();
-                ShowSavedReplays(player, creature, true);
-                break;
-            case GOSSIP_ACTION_INFO_DEF + 1:
-                player->PlayerTalkClass->SendCloseGossip();
-                ShowSavedReplays(player, creature, false);
-                break;
-            case GOSSIP_ACTION_INFO_DEF:
-                OnGossipHello(player, creature);
-                break;
-            default:
-                if (action >= GOSSIP_ACTION_INFO_DEF + 10)
-                    return replayArenaMatch(player, action - (GOSSIP_ACTION_INFO_DEF + 10));
-                break;
-        }
-
-        return true;
-    }
-
-    bool OnGossipSelectCode(Player* player, Creature* creature, uint32 sender, uint32 action, const char* code) override
-    {
-        if (action == 0)
+        case REPLAY_MATCH_ID:
         {
-            if (!code)
-                return false;
-
-            CloseGossipMenuFor(player);
-
+            uint32 replayId;
             try
             {
-                uint32 replayId = static_cast<uint32>(std::stoul(code));
-                return replayArenaMatch(player, replayId);
+                replayId = std::stoi(code);
             }
-            catch (...) // invalid input
+            catch (...)
             {
                 ChatHandler(player->GetSession()).PSendSysMessage("Invalid Match ID.");
+                CloseGossipMenuFor(player);
+                return false;
+            }
+
+            return replayArenaMatch(player, replayId);
+        }
+        case REPLAY_LIST_BY_PLAYERNAME:
+        {
+            CharacterCacheEntry const* playerData = sCharacterCache->GetCharacterCacheByName(std::string(code));
+            if (!playerData)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage("No player found with the name: {}", std::string(code));
+                CloseGossipMenuFor(player);
+                return false;
+            }
+
+            std::string playerGuidStr = std::to_string(playerData->Guid.GetRawValue());
+
+            QueryResult result = CharacterDatabase.Query("SELECT id FROM character_arena_replays WHERE winnerPlayerGuids LIKE '%{}%' OR loserPlayerGuids LIKE '%{}%'", playerGuidStr, playerGuidStr);
+            if (result)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage("Replays found for player: {}", std::string(code));
+                do
+                {
+                    Field* fields = result->Fetch();
+                    uint32 replayId = fields[0].Get<uint32>();
+                    ChatHandler(player->GetSession()).PSendSysMessage("Replay ID: {}", replayId);
+                    //AddGossipItemFor(player,) // to do: add gossips with the replays
+                } while (result->NextRow());
+
+                CloseGossipMenuFor(player);
+                return true;
+            }
+            else
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage("No replays found for player: {}", std::string(code));
+                CloseGossipMenuFor(player);
                 return false;
             }
         }
-        else if (action == 5)
+        case MY_FAVORITE_MATCHES:
         {
-            if (!code)
-                return false;
-
-            CloseGossipMenuFor(player);
-
             try
             {
-                uint32 replayId = static_cast<uint32>(std::stoul(code));
-                BookmarkMatch(player->GetGUID().GetCounter(), replayId);
+                uint32 NumberTyped = std::stoi(code);
+                FavoriteMatchId(player->GetGUID().GetCounter(), NumberTyped);
                 return true;
             }
             catch (...)
             {
                 ChatHandler(player->GetSession()).PSendSysMessage("Invalid Match ID.");
+                CloseGossipMenuFor(player);
                 return false;
             }
+        }
         }
 
         return false;
     }
 
 private:
-    void ShowReplayList(Player* player, Creature* creature, std::vector<uint32> const& matchIds)
-    {
-        uint32 base = GOSSIP_ACTION_INFO_DEF + 10;
 
-        if (matchIds.empty())
+    std::string GetClassIconById(uint8 id)
+    {
+        switch (id)
+        {
+        case CLASS_WARRIOR:
+            return "|TInterface\\icons\\inv_sword_27";
+        case CLASS_PALADIN:
+            return "|TInterface\\icons\\inv_hammer_01";
+        case CLASS_HUNTER:
+            return "|TInterface\\icons\\inv_weapon_bow_07";
+        case CLASS_ROGUE:
+            return "|TInterface\\icons\\inv_throwingknife_04";
+        case CLASS_PRIEST:
+            return "|TInterface\\icons\\inv_staff_30";
+        case CLASS_DEATH_KNIGHT:
+            return "|TInterface\\icons\\spell_deathknight_classicon";
+        case CLASS_SHAMAN:
+            return "|TInterface\\icons\\inv_jewelry_talisman_04";
+        case CLASS_MAGE:
+            return "|TInterface\\icons\\inv_staff_13";
+        case CLASS_WARLOCK:
+            return "|TInterface\\icons\\spell_nature_drowsy";
+        case CLASS_DRUID:
+            return "|TInterface\\icons\\inv_misc_monsterclaw_04";
+        default:
+            return "";
+        }
+    }
+
+    std::string GetRaceIconById(uint8 id, uint8 gender) {
+        const std::string gender_icon = gender == GENDER_MALE ? "male" : "female";
+        switch (id) {
+        case RACE_HUMAN:
+            return "|TInterface/ICONS/achievement_character_human_" + gender_icon;
+        case RACE_ORC:
+            return "|TInterface/ICONS/achievement_character_orc_" + gender_icon;
+        case RACE_DWARF:
+            return "|TInterface/ICONS/achievement_character_dwarf_" + gender_icon;
+        case RACE_NIGHTELF:
+            return "|TInterface/ICONS/achievement_character_nightelf_" + gender_icon;
+        case RACE_UNDEAD_PLAYER:
+            return "|TInterface/ICONS/achievement_character_undead_" + gender_icon;
+        case RACE_TAUREN:
+            return "|TInterface/ICONS/achievement_character_tauren_" + gender_icon;
+        case RACE_GNOME:
+            return "|TInterface/ICONS/achievement_character_gnome_" + gender_icon;
+        case RACE_TROLL:
+            return "|TInterface/ICONS/achievement_character_troll_" + gender_icon;
+        case RACE_BLOODELF:
+            return "|TInterface/ICONS/achievement_character_bloodelf_" + gender_icon;
+        case RACE_DRAENEI:
+            return "|TInterface/ICONS/achievement_character_draenei_" + gender_icon;
+        default:
+            return "";
+        }
+    }
+
+    std::string GetPlayersIconTexts(std::string playerGuids) {
+        std::string iconsTextTeam;
+        std::vector<std::string> playerGuidsTeam1;
+
+        std::stringstream ssPlayerGuids(playerGuids);
+        std::string item;
+
+        while (std::getline(ssPlayerGuids, item, ','))
+            playerGuidsTeam1.push_back(item);
+
+        for (const std::string& guid : playerGuidsTeam1)
+        {
+            uint64 _guid = std::stoi(guid);
+            CharacterCacheEntry const* playerData = sCharacterCache->GetCharacterCacheByGuid(ObjectGuid(_guid));
+            if (playerData)
+            {
+                iconsTextTeam += GetClassIconById(playerData->Class) + ":14:14:05:00|t|r";
+                iconsTextTeam += GetRaceIconById(playerData->Race, playerData->Sex) + ":14:14:05:00|t|r ";
+            }
+        }
+
+        if (!iconsTextTeam.empty() && iconsTextTeam.back() == '\n')
+            iconsTextTeam.pop_back();
+
+        return iconsTextTeam;
+    }
+
+    struct ReplayInfo
+    {
+        uint32 matchId;
+
+        std::string winnerPlayerGuids;
+        std::string winnerTeamName;
+        uint32 winnerTeamRating;
+
+        std::string loserPlayerGuids;
+        std::string loserTeamName;
+        uint32 loserTeamRating;
+
+        //uint32 winnerMMR;
+        //uint32 loserMMR;
+    };
+
+    std::string GetGossipText(ReplayInfo info) {
+        std::string iconsTextTeam1 = GetPlayersIconTexts(info.winnerPlayerGuids);
+        std::string iconsTextTeam2 = GetPlayersIconTexts(info.loserPlayerGuids);
+
+        std::string coloredWinnerTeamName = "|cff33691E" + info.winnerTeamName + "|r";
+        std::string LoserTeamName = info.loserTeamName;
+
+        std::string gossipText = ("[" + std::to_string(info.matchId) + "] (" +
+            std::to_string(info.winnerTeamRating) + ")" +
+            iconsTextTeam1 + "" +
+            " '" + coloredWinnerTeamName + "'" +
+            "\n vs (" + std::to_string(info.loserTeamRating) + ")" +
+            iconsTextTeam2 + "" +
+            " '" + LoserTeamName + "'");
+
+        return gossipText;
+    }
+
+    void ShowReplaysAllTime(Player* player, Creature* creature, uint8 arenaTypeId)
+    {
+        auto matchInfos = loadReplaysAllTimeByArenaType(arenaTypeId);
+        ShowReplays(player, creature, matchInfos);
+    }
+
+    std::vector<ReplayInfo> loadReplaysAllTimeByArenaType(uint8 arenaTypeId)
+    {
+        std::vector<ReplayInfo> records;
+        QueryResult result = CharacterDatabase.Query("SELECT id, winnerTeamName, winnerTeamRating, winnerPlayerGuids, loserTeamName, loserTeamRating, loserPlayerGuids FROM character_arena_replays WHERE arenaTypeId = {} ORDER BY winnerTeamRating DESC LIMIT 20", arenaTypeId);
+
+        if (!result)
+            return records;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            if (!fields)
+                return records;
+
+            ReplayInfo info;
+            info.matchId = fields[0].Get<uint32>();
+            info.winnerTeamName = fields[1].Get<std::string>();
+            info.winnerTeamRating = fields[2].Get<uint32>();
+            info.winnerPlayerGuids = fields[3].Get<std::string>();
+            info.loserTeamName = fields[4].Get<std::string>();
+            info.loserTeamRating = fields[5].Get<uint32>();
+            info.loserPlayerGuids = fields[6].Get<std::string>();
+
+            records.push_back(info);
+        } while (result->NextRow());
+
+        return records;
+    }
+
+    void ShowReplaysLast30Days(Player* player, Creature* creature, uint8 arenaTypeId)
+    {
+        auto matchInfos = loadReplaysLast30Days(arenaTypeId);
+        ShowReplays(player, creature, matchInfos);
+    }
+
+    std::vector<ReplayInfo> loadReplaysLast30Days(uint8 arenaTypeId)
+    {
+        std::vector<ReplayInfo> records;
+
+        std::time_t now = std::time(nullptr);
+        std::tm* tmNow = std::localtime(&now);
+        tmNow->tm_mday -= 30;
+        std::mktime(tmNow);
+
+        std::stringstream ss;
+        ss << std::put_time(tmNow, "%Y-%m-%d %H:%M:%S");
+        std::string thirtyDaysAgo = ss.str();
+
+        // Only show games that are 30 days old
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT id, winnerTeamName, winnerTeamRating, winnerPlayerGuids, loserTeamName, loserTeamRating, loserPlayerGuids, timestamp "
+            "FROM character_arena_replays "
+            "WHERE arenaTypeId = {} AND timestamp >= '{}' "
+            "ORDER BY id DESC LIMIT 20", arenaTypeId, thirtyDaysAgo.c_str());
+
+        if (!result)
+            return records;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            if (!fields)
+                return records;
+
+            ReplayInfo info;
+            info.matchId = fields[0].Get<uint32>();
+            info.winnerTeamName = fields[1].Get<std::string>();
+            info.winnerTeamRating = fields[2].Get<uint32>();
+            info.winnerPlayerGuids = fields[3].Get<std::string>();
+            info.loserTeamName = fields[4].Get<std::string>();
+            info.loserTeamRating = fields[5].Get<uint32>();
+            info.loserPlayerGuids = fields[6].Get<std::string>();
+
+            records.push_back(info);
+        } while (result->NextRow());
+
+        return records;
+    }
+
+    void ShowMostWatchedReplays(Player* player, Creature* creature)
+    {
+        auto matchInfos = loadMostWatchedReplays();
+        ShowReplays(player, creature, matchInfos);
+    }
+
+    void ShowReplays(Player* player, Creature* creature, std::vector<ReplayInfo> matchInfos) {
+        if (matchInfos.empty())
             AddGossipItemFor(player, GOSSIP_ICON_TAXI, "No replays found.", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
         else
         {
-            for (uint32 id : matchIds)
-                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay match " + std::to_string(id), GOSSIP_SENDER_MAIN, base + id);
+            AddGossipItemFor(player, GOSSIP_ICON_TRAINER, "[Replay ID] (Team Rating) 'Team Name'\n----------------------------------------------", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF); // Back to Main Menu
+            for (const auto& info : matchInfos)
+            {
+                const std::string gossipText = GetGossipText(info);
+                const uint32 actionOffset = GOSSIP_ACTION_INFO_DEF + 30;
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, gossipText, GOSSIP_SENDER_MAIN, actionOffset + info.matchId);
+            }
         }
 
         AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Back", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
     }
 
-    void ShowSavedReplays(Player* player, Creature* creature, bool firstPage)
+    std::vector<ReplayInfo> loadMostWatchedReplays()
     {
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Bookmark a Match ID", GOSSIP_SENDER_MAIN, 5, "Enter the Match ID", 0, true);
+        std::vector<ReplayInfo> records;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT id, winnerTeamName, winnerTeamRating, winnerPlayerGuids, loserTeamName, loserTeamRating, loserPlayerGuids "
+            "FROM character_arena_replays "
+            "ORDER BY timesWatched DESC, winnerTeamRating DESC "
+            "LIMIT 28");
 
-        auto matchIds = LoadSavedReplays(player->GetGUID().GetCounter(), firstPage);
-        uint32 base = GOSSIP_ACTION_INFO_DEF + 10;
+        if (!result)
+            return records;
 
-        if (matchIds.empty())
+        do
+        {
+            Field* fields = result->Fetch();
+            if (!fields)
+                return records;
+
+            ReplayInfo info;
+            info.matchId = fields[0].Get<uint32>();
+            info.winnerTeamName = fields[1].Get<std::string>();
+            info.winnerTeamRating = fields[2].Get<uint32>();
+            info.winnerPlayerGuids = fields[3].Get<std::string>();
+            info.loserTeamName = fields[4].Get<std::string>();
+            info.loserTeamRating = fields[5].Get<uint32>();
+            info.loserPlayerGuids = fields[6].Get<std::string>();
+
+            records.push_back(info);
+        } while (result->NextRow());
+
+        return records;
+    }
+
+    void ShowSavedReplays(Player* player, Creature* creature, bool firstPage = true)
+    {
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Favorite a Match ID", GOSSIP_SENDER_MAIN, MY_FAVORITE_MATCHES, "", 0, true);
+
+        std::string sortOrder = (firstPage) ? "ASC" : "DESC";
+        QueryResult result = CharacterDatabase.Query("SELECT replay_id FROM character_saved_replays WHERE character_id = " + std::to_string(player->GetGUID().GetCounter()) + " ORDER BY id " + sortOrder + " LIMIT 29");
+        if (!result)
             AddGossipItemFor(player, GOSSIP_ICON_TAXI, "No saved replays found.", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
         else
         {
-            for (uint32 id : matchIds)
-                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay match " + std::to_string(id), GOSSIP_SENDER_MAIN, base + id);
+            do
+            {
+                Field* fields = result->Fetch();
+                if (!fields)
+                    break;
+
+                uint32 matchId = fields[0].Get<uint32>();
+                const uint32 actionOffset = GOSSIP_ACTION_INFO_DEF + 30;
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Replay match " + std::to_string(matchId), GOSSIP_SENDER_MAIN, actionOffset + matchId);
+
+            } while (result->NextRow());
+
+            if (firstPage) // to do
+            {
+                //AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Next Page", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 1);
+            }
         }
-
-        if (firstPage)
-            AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Next Page", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + 1);
-
         AddGossipItemFor(player, GOSSIP_ICON_TAXI, "Back", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF);
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
     }
 
-    void BookmarkMatch(uint64 playerGuid, uint32 replayId)
+    void FavoriteMatchId(uint64 playerGuid, uint32 code)
     {
-        CharacterDatabase.Execute("INSERT IGNORE INTO character_saved_replays (character_id, replay_id) VALUES ({}, {})",
-            uint32(playerGuid), replayId);
+        // Need to check if the match exists in character_arena_replays, then insert in character_saved_replays
+        QueryResult result = CharacterDatabase.Query("SELECT id FROM character_arena_replays WHERE id = " + std::to_string(code));
+        if (result)
+        {
+            std::string query = "INSERT INTO character_saved_replays (character_id, replay_id) VALUES (" + std::to_string(playerGuid) + ", " + std::to_string(code) + ")";
+            CharacterDatabase.Execute(query.c_str());
+
+            if (Player* player = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(playerGuid)))
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage("Replay match ID {} saved.", code);
+                CloseGossipMenuFor(player);
+            }
+        }
+        else
+        {
+            if (Player* player = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(playerGuid)))
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage("Replay match ID {} does not exist.", code);
+                CloseGossipMenuFor(player);
+            }
+        }
     }
 
     bool replayArenaMatch(Player* player, uint32 replayId)
     {
-        ChatHandler handler(player->GetSession());
+        auto handler = ChatHandler(player->GetSession());
 
-        std::optional<MatchRecord> record = loadReplayData(replayId);
-        if (!record)
+        if (player->InBattlegroundQueue())
         {
-            handler.PSendSysMessage("Replay data not found.");
+            handler.PSendSysMessage("Can't be queued for arena or bg.");
             return false;
         }
 
-        Battleground* bg = sBattlegroundMgr->CreateNewBattleground(record->typeId,
-            GetBattlegroundBracketByLevel(record->mapId, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)),
-            record->arenaTypeId, false);
+        if (!loadReplayDataForPlayer(player, replayId))
+        {
+            CloseGossipMenuFor(player);
+            return false;
+        }
 
+        MatchRecord record = loadedReplays[player->GetGUID().GetCounter()];
+
+        Battleground* bg = sBattlegroundMgr->CreateNewBattleground(record.typeId, GetBattlegroundBracketByLevel(record.mapId, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)), record.arenaTypeId, false);
         if (!bg)
         {
             handler.PSendSysMessage("Couldn't create arena map!");
@@ -568,12 +1043,14 @@ private:
             return false;
         }
 
+        bgReplayIds[bg->GetInstanceID()] = player->GetGUID().GetCounter();
         player->SetPendingSpectatorForBG(bg->GetInstanceID());
-        s_activeReplays[bg->GetInstanceID()] = std::move(*record);
         bg->StartBattleground();
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
+
         TeamId teamId = Player::TeamIdForRace(player->getRace());
+
         uint32 queueSlot = 0;
         WorldPacket data;
 
@@ -582,72 +1059,114 @@ private:
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
         sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0, bg->GetStartTime(), bg->GetArenaType(), teamId);
         player->GetSession()->SendPacket(&data);
-        handler.PSendSysMessage("Replay ID %u begins.", replayId);
+        handler.PSendSysMessage("Replay ID {} begins.", replayId);
+
         return true;
     }
 
-    std::optional<MatchRecord> loadReplayData(uint32 matchId)
+    bool loadReplayDataForPlayer(Player* p, uint32 matchId)
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT id, arenaTypeId, typeId, contentSize, contents, mapId FROM character_arena_replays WHERE id = {}",
-            matchId);
-
+        QueryResult result = CharacterDatabase.Query("SELECT id, arenaTypeId, typeId, contentSize, contents, mapId, timesWatched FROM character_arena_replays WHERE id = {}", matchId);
         if (!result)
-            return std::nullopt;
+        {
+            ChatHandler(p->GetSession()).PSendSysMessage("Replay data not found.");
+            CloseGossipMenuFor(p);
+            return false;
+        }
 
         Field* fields = result->Fetch();
         if (!fields)
-            return std::nullopt;
+        {
+            ChatHandler(p->GetSession()).PSendSysMessage("Replay data not found.");
+            CloseGossipMenuFor(p);
+            return false;
+        }
+
+        // Update 'timesWatched' of a Replay +1 everytime someone watches it
+        uint32 timesWatched = fields[6].Get<uint32>();
+        timesWatched++;
+        CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
 
         MatchRecord record;
         deserializeMatchData(record, fields);
-        return record;
+
+        loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
+        return true;
     }
 
     void deserializeMatchData(MatchRecord& record, Field* fields)
     {
         record.arenaTypeId = uint8(fields[1].Get<uint32>());
         record.typeId = BattlegroundTypeId(fields[2].Get<uint32>());
-        uint32 contentSize = fields[3].Get<uint32>();
-        std::vector<uint8> data = FromHex(fields[4].Get<std::string>());
-        record.mapId = fields[5].Get<uint32>();
-
+        std::vector<uint8> data = *Acore::Encoding::Base32::Decode(fields[4].Get<std::string>());
+        record.mapId = uint32(fields[5].Get<uint32>());
         ByteBuffer buffer;
-        size_t appendSize = std::min<size_t>(contentSize, data.size());
-        if (appendSize > 0)
-            buffer.append(data.data(), appendSize);
+        buffer.append(&data[0], data.size());
 
-        while (buffer.rpos() < buffer.size())
+        /** deserialize replay binary data **/
+        uint32 packetSize;
+        uint32 packetTimestamp;
+        uint16 opcode;
+        while (buffer.rpos() <= buffer.size() - 1)
         {
-            if (buffer.size() - buffer.rpos() < sizeof(uint32) + sizeof(uint32) + sizeof(uint16))
-                break;
-
-            uint32 packetSize;
-            uint32 packetTimestamp;
-            uint16 opcode;
             buffer >> packetSize;
             buffer >> packetTimestamp;
             buffer >> opcode;
 
-            if (buffer.size() - buffer.rpos() < packetSize)
-                break;
-
             WorldPacket packet(opcode, packetSize);
+
             if (packetSize > 0)
             {
-                std::vector<uint8> tmp(packetSize);
-                buffer.read(tmp.data(), packetSize);
-                packet.append(tmp.data(), packetSize);
+                std::vector<uint8> tmp(packetSize, 0);
+                buffer.read(&tmp[0], packetSize);
+                packet.append(&tmp[0], packetSize);
             }
 
-            record.packets.push_back({ packetTimestamp, std::move(packet) });
+            record.packets.push_back({ packetTimestamp, packet });
+        }
+    }
+};
+
+class ConfigLoaderArenaReplay : public WorldScript
+{
+public:
+    ConfigLoaderArenaReplay() : WorldScript("config_loader_arena_replay", {
+        WORLDHOOK_ON_AFTER_CONFIG_LOAD
+        }) {
+    }
+    virtual void OnAfterConfigLoad(bool /*Reload*/) override
+    {
+        DeleteOldReplays();
+    }
+
+private:
+    void DeleteOldReplays()
+    {
+        // delete all the replays older than X days
+        const auto days = sConfigMgr->GetOption<uint32>("ArenaReplay.DeleteReplaysAfterDays", 30);
+        if (days > 0)
+        {
+            std::string addition = "";
+
+            const bool deleteSavedReplays = sConfigMgr->GetOption<bool>("ArenaReplay.DeleteSavedReplays", false);
+
+            if (!deleteSavedReplays)
+                addition = "AND `id` NOT IN (SELECT `replay_id` FROM `character_saved_replays`)";
+
+            const auto query = "DELETE FROM `character_arena_replays` WHERE `timestamp` < (NOW() - INTERVAL " + std::to_string(days) + " DAY) " + addition;
+            CharacterDatabase.Execute(query);
+
+            if (deleteSavedReplays)
+                CharacterDatabase.Execute("DELETE FROM `character_saved_replays` WHERE `replay_id` NOT IN (SELECT `id` FROM `character_arena_replays`)");
         }
     }
 };
 
 void AddArenaReplayScripts()
 {
+    new ConfigLoaderArenaReplay();
     new ArenaReplayServerScript();
     new ArenaReplayBGScript();
+    new ArenaReplayArenaScript();
     new ReplayGossip();
 }

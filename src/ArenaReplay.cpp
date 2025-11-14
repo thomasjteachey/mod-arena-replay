@@ -17,6 +17,8 @@
 #include <iomanip>
 #include <unordered_map>
 #include <algorithm>
+#include <array>
+#include <cstring>
 
 std::vector<Opcodes> watchList =
 {
@@ -103,6 +105,119 @@ std::unordered_map<uint32, MatchRecord> records;
 std::unordered_map<uint64, MatchRecord> loadedReplays;
 std::unordered_map<uint32, uint32> bgReplayIds;
 std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
+
+namespace
+{
+    std::array<uint8, 8> GetGuidBytes(uint64 guid)
+    {
+        std::array<uint8, 8> bytes{};
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = uint8((guid >> (i * 8)) & 0xFF);
+
+        return bytes;
+    }
+
+    bool ReplayMetadataContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        if (std::find(record.participantGuids.begin(), record.participantGuids.end(), guid) != record.participantGuids.end())
+            return true;
+
+        for (PacketRecord const& packet : record.packets)
+        {
+            if (packet.sourceGuid == guid)
+                return true;
+        }
+
+        return false;
+    }
+
+    bool ReplayPayloadContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        auto guidBytes = GetGuidBytes(guid);
+        for (PacketRecord const& packet : record.packets)
+        {
+            if (packet.packet.size() < guidBytes.size())
+                continue;
+
+            uint8 const* data = packet.packet.contents();
+            if (!data)
+                continue;
+
+            for (size_t i = 0; i + guidBytes.size() <= packet.packet.size(); ++i)
+            {
+                if (std::memcmp(data + i, guidBytes.data(), guidBytes.size()) == 0)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool ReplayContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        return ReplayMetadataContainsGuid(record, guid) || ReplayPayloadContainsGuid(record, guid);
+    }
+
+    uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
+    {
+        uint64 candidate = originalGuid;
+        do
+        {
+            ++candidate;
+        } while (candidate == 0 || ReplayMetadataContainsGuid(record, candidate));
+
+        return candidate;
+    }
+
+    void ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        if (fromGuid == toGuid)
+            return;
+
+        if (packet.size() < sizeof(uint64))
+            return;
+
+        auto fromBytes = GetGuidBytes(fromGuid);
+        auto toBytes = GetGuidBytes(toGuid);
+
+        uint8* data = packet.size() > 0 ? const_cast<uint8*>(packet.contents()) : nullptr;
+        if (!data)
+            return;
+
+        for (size_t i = 0; i + fromBytes.size() <= packet.size(); ++i)
+        {
+            if (std::memcmp(data + i, fromBytes.data(), fromBytes.size()) == 0)
+                std::memcpy(data + i, toBytes.data(), toBytes.size());
+        }
+    }
+
+    void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)
+    {
+        if (viewerGuid == 0)
+            return;
+
+        if (!ReplayContainsGuid(record, viewerGuid))
+            return;
+
+        uint64 ghostGuid = GenerateGhostGuid(viewerGuid, record);
+        if (ghostGuid == viewerGuid)
+            return;
+
+        for (uint64& guid : record.participantGuids)
+        {
+            if (guid == viewerGuid)
+                guid = ghostGuid;
+        }
+
+        for (PacketRecord& packet : record.packets)
+        {
+            if (packet.sourceGuid == viewerGuid)
+                packet.sourceGuid = ghostGuid;
+
+            ReplaceGuidInPacket(packet.packet, viewerGuid, ghostGuid);
+        }
+    }
+}
 
 class ArenaReplayServerScript : public ServerScript
 {
@@ -1139,8 +1254,6 @@ private:
             return false;
         }
 
-        ChatHandler handler(p->GetSession());
-
         // Update 'timesWatched' of a Replay +1 everytime someone watches it
         uint32 timesWatched = fields[6].Get<uint32>();
         timesWatched++;
@@ -1153,15 +1266,9 @@ private:
         if (!fields[8].IsNull())
             AppendPlayerGuidsFromList(record.participantGuids, fields[8].Get<std::string>());
 
-        const uint64 playerGuidRaw = p->GetGUID().GetRawValue();
-        if (std::find(record.participantGuids.begin(), record.participantGuids.end(), playerGuidRaw) != record.participantGuids.end())
-        {
-            handler.PSendSysMessage("You can't watch a replay you participated in. Log onto a different character to view it.");
-            CloseGossipMenuFor(p);
-            return false;
-        }
-
         deserializeMatchData(record, fields);
+
+        RemapReplayGuidForViewer(record, p->GetGUID().GetRawValue());
 
         loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
         return true;

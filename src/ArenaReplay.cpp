@@ -360,7 +360,7 @@ public:
                 continue;
             }
 
-            WorldPacket* myPacket = &packetRecord.packet;
+            WorldPacket const* myPacket = &packetRecord.packet;
             Player* replayer = bg->GetPlayers().begin()->second;
             replayer->GetSession()->SendPacket(myPacket);
             match.packets.pop_front();

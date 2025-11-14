@@ -16,6 +16,9 @@
 #include "ScriptMgr.h"
 #include <iomanip>
 #include <unordered_map>
+#include <algorithm>
+#include <array>
+#include <cstring>
 
 std::vector<Opcodes> watchList =
 {
@@ -89,13 +92,132 @@ SMSG_PLAY_SPELL_VISUAL
 CMSG_ATTACKSWING
 CMSG_ATTACKSTOP*/
 
-struct PacketRecord { uint32 timestamp; WorldPacket packet; };
-struct MatchRecord { BattlegroundTypeId typeId; uint8 arenaTypeId; uint32 mapId; std::deque<PacketRecord> packets; };
+struct PacketRecord { uint32 timestamp; WorldPacket packet; uint64 sourceGuid = 0; };
+struct MatchRecord {
+    BattlegroundTypeId typeId;
+    uint8 arenaTypeId;
+    uint32 mapId;
+    std::deque<PacketRecord> packets;
+    std::vector<uint64> participantGuids;
+};
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
 std::unordered_map<uint32, MatchRecord> records;
 std::unordered_map<uint64, MatchRecord> loadedReplays;
 std::unordered_map<uint32, uint32> bgReplayIds;
 std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
+
+namespace
+{
+    std::array<uint8, 8> GetGuidBytes(uint64 guid)
+    {
+        std::array<uint8, 8> bytes{};
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = uint8((guid >> (i * 8)) & 0xFF);
+
+        return bytes;
+    }
+
+    bool ReplayMetadataContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        if (std::find(record.participantGuids.begin(), record.participantGuids.end(), guid) != record.participantGuids.end())
+            return true;
+
+        for (PacketRecord const& packet : record.packets)
+        {
+            if (packet.sourceGuid == guid)
+                return true;
+        }
+
+        return false;
+    }
+
+    bool ReplayPayloadContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        auto guidBytes = GetGuidBytes(guid);
+        for (PacketRecord const& packet : record.packets)
+        {
+            if (packet.packet.size() < guidBytes.size())
+                continue;
+
+            uint8 const* data = packet.packet.contents();
+            if (!data)
+                continue;
+
+            for (size_t i = 0; i + guidBytes.size() <= packet.packet.size(); ++i)
+            {
+                if (std::memcmp(data + i, guidBytes.data(), guidBytes.size()) == 0)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool ReplayContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        return ReplayMetadataContainsGuid(record, guid) || ReplayPayloadContainsGuid(record, guid);
+    }
+
+    uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
+    {
+        uint64 candidate = originalGuid;
+        do
+        {
+            ++candidate;
+        } while (candidate == 0 || ReplayMetadataContainsGuid(record, candidate));
+
+        return candidate;
+    }
+
+    void ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        if (fromGuid == toGuid)
+            return;
+
+        if (packet.size() < sizeof(uint64))
+            return;
+
+        auto fromBytes = GetGuidBytes(fromGuid);
+        auto toBytes = GetGuidBytes(toGuid);
+
+        uint8* data = packet.size() > 0 ? const_cast<uint8*>(packet.contents()) : nullptr;
+        if (!data)
+            return;
+
+        for (size_t i = 0; i + fromBytes.size() <= packet.size(); ++i)
+        {
+            if (std::memcmp(data + i, fromBytes.data(), fromBytes.size()) == 0)
+                std::memcpy(data + i, toBytes.data(), toBytes.size());
+        }
+    }
+
+    void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)
+    {
+        if (viewerGuid == 0)
+            return;
+
+        if (!ReplayContainsGuid(record, viewerGuid))
+            return;
+
+        uint64 ghostGuid = GenerateGhostGuid(viewerGuid, record);
+        if (ghostGuid == viewerGuid)
+            return;
+
+        for (uint64& guid : record.participantGuids)
+        {
+            if (guid == viewerGuid)
+                guid = ghostGuid;
+        }
+
+        for (PacketRecord& packet : record.packets)
+        {
+            if (packet.sourceGuid == viewerGuid)
+                packet.sourceGuid = ghostGuid;
+
+            ReplaceGuidInPacket(packet.packet, viewerGuid, ghostGuid);
+        }
+    }
+}
 
 class ArenaReplayServerScript : public ServerScript
 {
@@ -151,7 +273,7 @@ public:
         record.arenaTypeId = bg->GetArenaType();
         record.mapId = bg->GetMapId();
         // push back packet inside queue of matchId 0
-        record.packets.push_back({ timestamp, /* copy */ WorldPacket(packet) });
+        record.packets.push_back({ timestamp, /* copy */ WorldPacket(packet), session->GetPlayer()->GetGUID().GetRawValue() });
         return true;
     }
 };
@@ -224,12 +346,21 @@ public:
         }
 
         //send replay data to spectator
+        const uint64 replayerGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
             if (bg->GetPlayers().empty())
                 break;
 
-            WorldPacket* myPacket = &match.packets.front().packet;
+            PacketRecord const& packetRecord = match.packets.front();
+            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == replayerGuid)
+            {
+                match.packets.pop_front();
+                continue;
+            }
+
+            WorldPacket const* myPacket = &packetRecord.packet;
             Player* replayer = bg->GetPlayers().begin()->second;
             replayer->GetSession()->SendPacket(myPacket);
             match.packets.pop_front();
@@ -313,16 +444,25 @@ public:
         ArenaReplayByteBuffer buffer;
         uint32 headerSize;
         uint32 timestamp;
-        for (auto it : match.packets)
+        for (auto const& packetRecord : match.packets)
         {
-            headerSize = it.packet.size(); //header 4Bytes packet size
-            timestamp = it.timestamp;
+            headerSize = packetRecord.packet.size(); //header 4Bytes packet size
+            timestamp = packetRecord.timestamp;
 
-            buffer << headerSize; // 4 bytes
+            const bool hasSourceGuid = packetRecord.sourceGuid != 0;
+            uint32 sizeWithFlag = headerSize;
+            if (hasSourceGuid)
+                sizeWithFlag |= 0x80000000u;
+
+            buffer << sizeWithFlag; // 4 bytes
             buffer << timestamp; // 4 bytes
-            buffer << it.packet.GetOpcode(); // 2 bytes
+            buffer << packetRecord.packet.GetOpcode(); // 2 bytes
+
+            if (hasSourceGuid)
+                buffer << packetRecord.sourceGuid; // 8 bytes
+
             if (headerSize > 0)
-                buffer.append(it.packet.contents(), it.packet.size()); // headerSize bytes
+                buffer.append(packetRecord.packet.contents(), packetRecord.packet.size()); // headerSize bytes
         }
 
         uint32 teamWinnerRating = 0;
@@ -785,6 +925,38 @@ private:
         return iconsTextTeam;
     }
 
+    void AppendPlayerGuidsFromList(std::vector<uint64>& guids, std::string const& guidList)
+    {
+        if (guidList.empty())
+            return;
+
+        std::stringstream ss(guidList);
+        std::string entry;
+        while (std::getline(ss, entry, ','))
+        {
+            auto begin = entry.find_first_not_of(" \t\n\r");
+            if (begin == std::string::npos)
+                continue;
+
+            auto end = entry.find_last_not_of(" \t\n\r");
+            if (end == std::string::npos)
+                continue;
+
+            std::string trimmed = entry.substr(begin, end - begin + 1);
+            if (trimmed.empty())
+                continue;
+
+            try
+            {
+                guids.push_back(std::stoull(trimmed));
+            }
+            catch (...)
+            {
+                continue;
+            }
+        }
+    }
+
     struct ReplayInfo
     {
         uint32 matchId;
@@ -1066,7 +1238,7 @@ private:
 
     bool loadReplayDataForPlayer(Player* p, uint32 matchId)
     {
-        QueryResult result = CharacterDatabase.Query("SELECT id, arenaTypeId, typeId, contentSize, contents, mapId, timesWatched FROM character_arena_replays WHERE id = {}", matchId);
+        QueryResult result = CharacterDatabase.Query("SELECT id, arenaTypeId, typeId, contentSize, contents, mapId, timesWatched, winnerPlayerGuids, loserPlayerGuids FROM character_arena_replays WHERE id = {}", matchId);
         if (!result)
         {
             ChatHandler(p->GetSession()).PSendSysMessage("Replay data not found.");
@@ -1088,7 +1260,15 @@ private:
         CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
 
         MatchRecord record;
+        if (!fields[7].IsNull())
+            AppendPlayerGuidsFromList(record.participantGuids, fields[7].Get<std::string>());
+
+        if (!fields[8].IsNull())
+            AppendPlayerGuidsFromList(record.participantGuids, fields[8].Get<std::string>());
+
         deserializeMatchData(record, fields);
+
+        RemapReplayGuidForViewer(record, p->GetGUID().GetRawValue());
 
         loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
         return true;
@@ -1104,14 +1284,35 @@ private:
         buffer.append(&data[0], data.size());
 
         /** deserialize replay binary data **/
-        uint32 packetSize;
+        uint32 packedPacketSize;
         uint32 packetTimestamp;
         uint16 opcode;
-        while (buffer.rpos() <= buffer.size() - 1)
+        while (buffer.rpos() < buffer.size())
         {
-            buffer >> packetSize;
+            if (buffer.size() - buffer.rpos() < sizeof(uint32))
+                break;
+
+            buffer >> packedPacketSize;
+            bool hasSourceGuid = (packedPacketSize & 0x80000000u) != 0;
+            uint32 packetSize = packedPacketSize & 0x7FFFFFFFu;
+
+            if (buffer.size() - buffer.rpos() < sizeof(uint32) + sizeof(uint16))
+                break;
+
             buffer >> packetTimestamp;
             buffer >> opcode;
+
+            uint64 sourceGuid = 0;
+            if (hasSourceGuid)
+            {
+                if (buffer.size() - buffer.rpos() < sizeof(uint64))
+                    break;
+
+                buffer >> sourceGuid;
+            }
+
+            if (buffer.size() - buffer.rpos() < packetSize)
+                break;
 
             WorldPacket packet(opcode, packetSize);
 
@@ -1122,7 +1323,7 @@ private:
                 packet.append(&tmp[0], packetSize);
             }
 
-            record.packets.push_back({ packetTimestamp, packet });
+            record.packets.push_back({ packetTimestamp, packet, sourceGuid });
         }
     }
 };

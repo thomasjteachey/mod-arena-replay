@@ -20,6 +20,7 @@
 #include <array>
 #include <cstring>
 #include <vector>
+#include <limits>
 #include <zlib.h>
 
 std::vector<Opcodes> watchList =
@@ -110,6 +111,8 @@ std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
 
 namespace
 {
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid);
+
     std::array<uint8, 8> GetGuidBytes(uint64 guid)
     {
         std::array<uint8, 8> bytes{};
@@ -254,17 +257,9 @@ namespace
         return candidate;
     }
 
-    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
     {
-        if (fromGuid == toGuid)
-            return false;
-
-        size_t packetSize = packet.size();
-        if (packetSize == 0)
-            return false;
-
-        uint8 const* contents = packet.contents();
-        if (!contents)
+        if (payload.empty())
             return false;
 
         auto fromBytesArray = GetGuidBytes(fromGuid);
@@ -274,35 +269,148 @@ namespace
         std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
         std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
 
-        bool const isCompressed = packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT;
-        std::vector<uint8> buffer(contents, contents + packetSize);
-        std::vector<uint8> workingBuffer;
-
-        std::vector<uint8>& payload = isCompressed ? workingBuffer : buffer;
-        if (isCompressed)
-        {
-            if (!Decompress(buffer, workingBuffer))
-                return false;
-        }
-
         bool modified = ReplaceSequence(payload, fromBytes, toBytes);
 
         if (!fromPacked.empty() && !toPacked.empty())
             modified |= ReplaceSequence(payload, fromPacked, toPacked);
 
-        if (!modified)
+        return modified;
+    }
+
+    bool RewriteCompressedPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
             return false;
 
-        if (isCompressed)
-        {
-            if (!Compress(payload, buffer))
-                return false;
-        }
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        std::vector<uint8> decompressed;
+
+        if (!Decompress(buffer, decompressed))
+            return false;
+
+        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
+            return false;
+
+        if (!Compress(decompressed, buffer))
+            return false;
 
         WorldPacket updated(packet.GetOpcode(), buffer.size());
         updated.append(buffer.data(), buffer.size());
         packet = std::move(updated);
         return true;
+    }
+
+    bool RewriteRawPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), buffer.size());
+        updated.append(buffer.data(), buffer.size());
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool RewriteMultipacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize < sizeof(uint16) * 2)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        size_t offset = 0;
+        bool modified = false;
+        std::vector<uint8> rebuilt;
+        rebuilt.reserve(packetSize);
+
+        auto ReadUInt16 = [](uint8 const* ptr) -> uint16
+        {
+            return uint16(ptr[0] | (ptr[1] << 8));
+        };
+
+        auto WriteUInt16 = [&rebuilt](uint16 value)
+        {
+            rebuilt.push_back(uint8(value & 0xFF));
+            rebuilt.push_back(uint8((value >> 8) & 0xFF));
+        };
+
+        while (offset < packetSize)
+        {
+            if (packetSize - offset < sizeof(uint16) * 2)
+                return false;
+
+            uint16 opcode = ReadUInt16(contents + offset);
+            offset += sizeof(uint16);
+
+            uint16 length = ReadUInt16(contents + offset);
+            offset += sizeof(uint16);
+
+            if (packetSize - offset < length)
+                return false;
+
+            WorldPacket inner(opcode, length);
+            if (length > 0)
+                inner.append(contents + offset, length);
+
+            offset += length;
+
+            if (ReplaceGuidInPacket(inner, fromGuid, toGuid))
+                modified = true;
+
+            if (inner.size() > std::numeric_limits<uint16>::max())
+                return false;
+
+            uint16 newLength = static_cast<uint16>(inner.size());
+            WriteUInt16(opcode);
+            WriteUInt16(newLength);
+
+            if (newLength > 0)
+            {
+                uint8 const* innerData = inner.contents();
+                rebuilt.insert(rebuilt.end(), innerData, innerData + newLength);
+            }
+        }
+
+        if (!modified)
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), rebuilt.size());
+        if (!rebuilt.empty())
+            updated.append(rebuilt.data(), rebuilt.size());
+
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        if (fromGuid == toGuid)
+            return false;
+
+        if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
+            return RewriteMultipacket(packet, fromGuid, toGuid);
+
+        if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+            return RewriteCompressedPacket(packet, fromGuid, toGuid);
+
+        return RewriteRawPacket(packet, fromGuid, toGuid);
     }
 
     void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)

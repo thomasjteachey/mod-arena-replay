@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 std::vector<Opcodes> watchList =
 {
@@ -174,21 +175,34 @@ namespace
         if (fromGuid == toGuid)
             return;
 
-        if (packet.size() < sizeof(uint64))
+        size_t packetSize = packet.size();
+        if (packetSize < sizeof(uint64))
+            return;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
             return;
 
         auto fromBytes = GetGuidBytes(fromGuid);
         auto toBytes = GetGuidBytes(toGuid);
 
-        uint8* data = packet.size() > 0 ? const_cast<uint8*>(packet.contents()) : nullptr;
-        if (!data)
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        bool modified = false;
+        for (size_t i = 0; i + fromBytes.size() <= buffer.size(); ++i)
+        {
+            if (std::memcmp(buffer.data() + i, fromBytes.data(), fromBytes.size()) == 0)
+            {
+                std::memcpy(buffer.data() + i, toBytes.data(), toBytes.size());
+                modified = true;
+            }
+        }
+
+        if (!modified)
             return;
 
-        for (size_t i = 0; i + fromBytes.size() <= packet.size(); ++i)
-        {
-            if (std::memcmp(data + i, fromBytes.data(), fromBytes.size()) == 0)
-                std::memcpy(data + i, toBytes.data(), toBytes.size());
-        }
+        WorldPacket updated(packet.GetOpcode(), packetSize);
+        updated.append(buffer.data(), buffer.size());
+        packet = std::move(updated);
     }
 
     void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)
@@ -1278,10 +1292,14 @@ private:
     {
         record.arenaTypeId = uint8(fields[1].Get<uint32>());
         record.typeId = BattlegroundTypeId(fields[2].Get<uint32>());
-        std::vector<uint8> data = *Acore::Encoding::Base32::Decode(fields[4].Get<std::string>());
+        auto encodedData = Acore::Encoding::Base32::Decode(fields[4].Get<std::string>());
+        if (!encodedData)
+            return;
+
         record.mapId = uint32(fields[5].Get<uint32>());
         ByteBuffer buffer;
-        buffer.append(&data[0], data.size());
+        if (!encodedData->empty())
+            buffer.append(encodedData->data(), encodedData->size());
 
         /** deserialize replay binary data **/
         uint32 packedPacketSize;

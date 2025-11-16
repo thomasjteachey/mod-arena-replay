@@ -325,31 +325,38 @@ namespace
         return true;
     }
 
-    bool RewriteMultipacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    uint16 ReadUInt16(uint8 const* ptr)
     {
-        size_t packetSize = packet.size();
+        return uint16(ptr[0] | (ptr[1] << 8));
+    }
+
+    void AppendUInt16(std::vector<uint8>& buffer, uint16 value)
+    {
+        buffer.push_back(uint8(value & 0xFF));
+        buffer.push_back(uint8((value >> 8) & 0xFF));
+    }
+
+    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid, bool hasLeadingCount, std::vector<uint8>& rebuilt, bool& modified)
+    {
+        rebuilt.clear();
+        modified = false;
+
         if (packetSize < sizeof(uint16) * 2)
             return false;
 
-        uint8 const* contents = packet.contents();
-        if (!contents)
-            return false;
-
         size_t offset = 0;
-        bool modified = false;
-        std::vector<uint8> rebuilt;
-        rebuilt.reserve(packetSize);
+        uint16 expectedCount = 0;
+        uint16 parsedCount = 0;
 
-        auto ReadUInt16 = [](uint8 const* ptr) -> uint16
+        if (hasLeadingCount)
         {
-            return uint16(ptr[0] | (ptr[1] << 8));
-        };
+            if (packetSize < sizeof(uint16))
+                return false;
 
-        auto WriteUInt16 = [&rebuilt](uint16 value)
-        {
-            rebuilt.push_back(uint8(value & 0xFF));
-            rebuilt.push_back(uint8((value >> 8) & 0xFF));
-        };
+            expectedCount = ReadUInt16(contents);
+            AppendUInt16(rebuilt, expectedCount);
+            offset += sizeof(uint16);
+        }
 
         while (offset < packetSize)
         {
@@ -378,14 +385,62 @@ namespace
                 return false;
 
             uint16 newLength = static_cast<uint16>(inner.size());
-            WriteUInt16(opcode);
-            WriteUInt16(newLength);
+            AppendUInt16(rebuilt, opcode);
+            AppendUInt16(rebuilt, newLength);
 
             if (newLength > 0)
             {
                 uint8 const* innerData = inner.contents();
                 rebuilt.insert(rebuilt.end(), innerData, innerData + newLength);
             }
+
+            ++parsedCount;
+        }
+
+        if (hasLeadingCount && parsedCount != expectedCount)
+            return false;
+
+        if (!hasLeadingCount && parsedCount == 0)
+            return false;
+
+        return true;
+    }
+
+    bool RewriteMultipacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize < sizeof(uint16) * 2)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> rebuilt;
+        rebuilt.reserve(packetSize);
+        bool modified = false;
+
+        auto TryRewrite = [&](bool hasLeadingCount) -> bool
+        {
+            std::vector<uint8> candidate;
+            candidate.reserve(packetSize);
+            bool candidateModified = false;
+
+            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, candidate, candidateModified))
+                return false;
+
+            if (!candidateModified)
+                return true;
+
+            rebuilt = std::move(candidate);
+            modified = true;
+            return true;
+        };
+
+        if (!TryRewrite(true))
+        {
+            if (!TryRewrite(false))
+                return false;
         }
 
         if (!modified)

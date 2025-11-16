@@ -20,6 +20,7 @@
 #include <array>
 #include <cstring>
 #include <vector>
+#include <zlib.h>
 
 std::vector<Opcodes> watchList =
 {
@@ -179,6 +180,69 @@ namespace
         return modified;
     }
 
+    bool Decompress(std::vector<uint8> const& input, std::vector<uint8>& output)
+    {
+        if (input.size() <= sizeof(uint32))
+            return false;
+
+        uint32 decompressedSize;
+        std::memcpy(&decompressedSize, input.data(), sizeof(uint32));
+        if (decompressedSize == 0)
+            return false;
+
+        output.resize(decompressedSize);
+
+        z_stream stream;
+        std::memset(&stream, 0, sizeof(stream));
+        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(input.data() + sizeof(uint32)));
+        stream.avail_in = static_cast<uInt>(input.size() - sizeof(uint32));
+        stream.next_out = output.data();
+        stream.avail_out = static_cast<uInt>(output.size());
+
+        int ret = inflateInit(&stream);
+        if (ret != Z_OK)
+            return false;
+
+        ret = inflate(&stream, Z_FINISH);
+        inflateEnd(&stream);
+        if (ret != Z_STREAM_END)
+            return false;
+
+        output.resize(stream.total_out);
+        return true;
+    }
+
+    bool Compress(std::vector<uint8> const& input, std::vector<uint8>& output)
+    {
+        if (input.empty())
+            return false;
+
+        uLongf bound = compressBound(static_cast<uLong>(input.size()));
+        output.resize(sizeof(uint32) + bound);
+
+        uint32 inputSize = static_cast<uint32>(input.size());
+        std::memcpy(output.data(), &inputSize, sizeof(uint32));
+
+        z_stream stream;
+        std::memset(&stream, 0, sizeof(stream));
+        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(input.data()));
+        stream.avail_in = static_cast<uInt>(input.size());
+        stream.next_out = output.data() + sizeof(uint32);
+        stream.avail_out = static_cast<uInt>(bound);
+
+        int ret = deflateInit(&stream, Z_DEFAULT_COMPRESSION);
+        if (ret != Z_OK)
+            return false;
+
+        ret = deflate(&stream, Z_FINISH);
+        deflateEnd(&stream);
+        if (ret != Z_STREAM_END)
+            return false;
+
+        output.resize(sizeof(uint32) + stream.total_out);
+        return true;
+    }
+
     uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
     {
         uint64 candidate = originalGuid;
@@ -210,14 +274,30 @@ namespace
         std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
         std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
 
+        bool const isCompressed = packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT;
         std::vector<uint8> buffer(contents, contents + packetSize);
-        bool modified = ReplaceSequence(buffer, fromBytes, toBytes);
+        std::vector<uint8> workingBuffer;
+
+        std::vector<uint8>& payload = isCompressed ? workingBuffer : buffer;
+        if (isCompressed)
+        {
+            if (!Decompress(buffer, workingBuffer))
+                return false;
+        }
+
+        bool modified = ReplaceSequence(payload, fromBytes, toBytes);
 
         if (!fromPacked.empty() && !toPacked.empty())
-            modified |= ReplaceSequence(buffer, fromPacked, toPacked);
+            modified |= ReplaceSequence(payload, fromPacked, toPacked);
 
         if (!modified)
             return false;
+
+        if (isCompressed)
+        {
+            if (!Compress(payload, buffer))
+                return false;
+        }
 
         WorldPacket updated(packet.GetOpcode(), buffer.size());
         updated.append(buffer.data(), buffer.size());

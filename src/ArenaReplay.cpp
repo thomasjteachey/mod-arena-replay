@@ -132,31 +132,51 @@ namespace
         return false;
     }
 
-    bool ReplayPayloadContainsGuid(MatchRecord const& record, uint64 guid)
+    std::vector<uint8> GetPackedGuidBytes(uint64 guid)
     {
-        auto guidBytes = GetGuidBytes(guid);
-        for (PacketRecord const& packet : record.packets)
+        std::array<uint8, 8> guidBytes = GetGuidBytes(guid);
+        uint8 mask = 0;
+        std::vector<uint8> packed;
+        packed.reserve(9);
+
+        for (uint8 i = 0; i < guidBytes.size(); ++i)
         {
-            if (packet.packet.size() < guidBytes.size())
+            if (guidBytes[i] == 0)
                 continue;
 
-            uint8 const* data = packet.packet.contents();
-            if (!data)
-                continue;
+            mask |= (1u << i);
+            packed.push_back(guidBytes[i]);
+        }
 
-            for (size_t i = 0; i + guidBytes.size() <= packet.packet.size(); ++i)
+        if (mask == 0)
+            return {};
+
+        packed.insert(packed.begin(), mask);
+        return packed;
+    }
+
+    bool ReplaceSequence(std::vector<uint8>& buffer, std::vector<uint8> const& from, std::vector<uint8> const& to)
+    {
+        if (from.empty() || from == to)
+            return false;
+
+        bool modified = false;
+        for (size_t i = 0; i + from.size() <= buffer.size();)
+        {
+            if (std::memcmp(buffer.data() + i, from.data(), from.size()) == 0)
             {
-                if (std::memcmp(data + i, guidBytes.data(), guidBytes.size()) == 0)
-                    return true;
+                buffer.erase(buffer.begin() + i, buffer.begin() + i + from.size());
+                buffer.insert(buffer.begin() + i, to.begin(), to.end());
+                i += to.size();
+                modified = true;
+            }
+            else
+            {
+                ++i;
             }
         }
 
-        return false;
-    }
-
-    bool ReplayContainsGuid(MatchRecord const& record, uint64 guid)
-    {
-        return ReplayMetadataContainsGuid(record, guid) || ReplayPayloadContainsGuid(record, guid);
+        return modified;
     }
 
     uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
@@ -170,47 +190,44 @@ namespace
         return candidate;
     }
 
-    void ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
     {
         if (fromGuid == toGuid)
-            return;
+            return false;
 
         size_t packetSize = packet.size();
-        if (packetSize < sizeof(uint64))
-            return;
+        if (packetSize == 0)
+            return false;
 
         uint8 const* contents = packet.contents();
         if (!contents)
-            return;
+            return false;
 
-        auto fromBytes = GetGuidBytes(fromGuid);
-        auto toBytes = GetGuidBytes(toGuid);
+        auto fromBytesArray = GetGuidBytes(fromGuid);
+        auto toBytesArray = GetGuidBytes(toGuid);
+        std::vector<uint8> fromBytes(fromBytesArray.begin(), fromBytesArray.end());
+        std::vector<uint8> toBytes(toBytesArray.begin(), toBytesArray.end());
+        std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
+        std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
 
         std::vector<uint8> buffer(contents, contents + packetSize);
-        bool modified = false;
-        for (size_t i = 0; i + fromBytes.size() <= buffer.size(); ++i)
-        {
-            if (std::memcmp(buffer.data() + i, fromBytes.data(), fromBytes.size()) == 0)
-            {
-                std::memcpy(buffer.data() + i, toBytes.data(), toBytes.size());
-                modified = true;
-            }
-        }
+        bool modified = ReplaceSequence(buffer, fromBytes, toBytes);
+
+        if (!fromPacked.empty() && !toPacked.empty())
+            modified |= ReplaceSequence(buffer, fromPacked, toPacked);
 
         if (!modified)
-            return;
+            return false;
 
-        WorldPacket updated(packet.GetOpcode(), packetSize);
+        WorldPacket updated(packet.GetOpcode(), buffer.size());
         updated.append(buffer.data(), buffer.size());
         packet = std::move(updated);
+        return true;
     }
 
     void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)
     {
         if (viewerGuid == 0)
-            return;
-
-        if (!ReplayContainsGuid(record, viewerGuid))
             return;
 
         uint64 ghostGuid = GenerateGhostGuid(viewerGuid, record);

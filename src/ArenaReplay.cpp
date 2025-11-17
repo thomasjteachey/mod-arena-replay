@@ -330,19 +330,29 @@ namespace
         return uint16(ptr[0] | (ptr[1] << 8));
     }
 
+    uint32 ReadUInt32(uint8 const* ptr)
+    {
+        return uint32(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24));
+    }
+
     void AppendUInt16(std::vector<uint8>& buffer, uint16 value)
     {
         buffer.push_back(uint8(value & 0xFF));
         buffer.push_back(uint8((value >> 8) & 0xFF));
     }
 
-    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid, bool hasLeadingCount, bool opcodeFirst, std::vector<uint8>& rebuilt, bool& modified)
+    void AppendUInt32(std::vector<uint8>& buffer, uint32 value)
+    {
+        buffer.push_back(uint8(value & 0xFF));
+        buffer.push_back(uint8((value >> 8) & 0xFF));
+        buffer.push_back(uint8((value >> 16) & 0xFF));
+        buffer.push_back(uint8((value >> 24) & 0xFF));
+    }
+
+    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid, bool hasLeadingCount, bool opcodeFirst, size_t lengthFieldBytes, std::vector<uint8>& rebuilt, bool& modified)
     {
         rebuilt.clear();
         modified = false;
-
-        if (packetSize < sizeof(uint16) * 2)
-            return false;
 
         size_t offset = 0;
         uint16 expectedCount = 0;
@@ -360,17 +370,32 @@ namespace
 
         while (offset < packetSize)
         {
-            if (packetSize - offset < sizeof(uint16) * 2)
+            if (lengthFieldBytes != sizeof(uint16) && lengthFieldBytes != sizeof(uint32))
                 return false;
 
-            uint16 first = ReadUInt16(contents + offset);
-            offset += sizeof(uint16);
+            size_t headerSize = sizeof(uint16) + lengthFieldBytes;
+            if (packetSize - offset < headerSize)
+                return false;
 
-            uint16 second = ReadUInt16(contents + offset);
-            offset += sizeof(uint16);
+            uint16 opcode = 0;
+            uint32 length = 0;
 
-            uint16 opcode = opcodeFirst ? first : second;
-            uint16 length = opcodeFirst ? second : first;
+            if (opcodeFirst)
+            {
+                opcode = ReadUInt16(contents + offset);
+                offset += sizeof(uint16);
+
+                length = lengthFieldBytes == sizeof(uint16) ? ReadUInt16(contents + offset) : ReadUInt32(contents + offset);
+                offset += lengthFieldBytes;
+            }
+            else
+            {
+                length = lengthFieldBytes == sizeof(uint16) ? ReadUInt16(contents + offset) : ReadUInt32(contents + offset);
+                offset += lengthFieldBytes;
+
+                opcode = ReadUInt16(contents + offset);
+                offset += sizeof(uint16);
+            }
 
             if (packetSize - offset < length)
                 return false;
@@ -384,18 +409,24 @@ namespace
             if (ReplaceGuidInPacket(inner, fromGuid, toGuid))
                 modified = true;
 
-            if (inner.size() > std::numeric_limits<uint16>::max())
+            uint32 newLength = static_cast<uint32>(inner.size());
+            if (lengthFieldBytes == sizeof(uint16) && newLength > std::numeric_limits<uint16>::max())
                 return false;
 
-            uint16 newLength = static_cast<uint16>(inner.size());
             if (opcodeFirst)
             {
                 AppendUInt16(rebuilt, opcode);
-                AppendUInt16(rebuilt, newLength);
+                if (lengthFieldBytes == sizeof(uint16))
+                    AppendUInt16(rebuilt, static_cast<uint16>(newLength));
+                else
+                    AppendUInt32(rebuilt, newLength);
             }
             else
             {
-                AppendUInt16(rebuilt, newLength);
+                if (lengthFieldBytes == sizeof(uint16))
+                    AppendUInt16(rebuilt, static_cast<uint16>(newLength));
+                else
+                    AppendUInt32(rebuilt, newLength);
                 AppendUInt16(rebuilt, opcode);
             }
 
@@ -431,13 +462,13 @@ namespace
         rebuilt.reserve(packetSize);
         bool modified = false;
 
-        auto TryRewrite = [&](bool hasLeadingCount, bool opcodeFirst) -> bool
+        auto TryRewrite = [&](bool hasLeadingCount, bool opcodeFirst, size_t lengthFieldBytes) -> bool
         {
             std::vector<uint8> candidate;
             candidate.reserve(packetSize);
             bool candidateModified = false;
 
-            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, opcodeFirst, candidate, candidateModified))
+            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, opcodeFirst, lengthFieldBytes, candidate, candidateModified))
                 return false;
 
             if (!candidateModified)
@@ -448,17 +479,40 @@ namespace
             return true;
         };
 
-        if (!TryRewrite(true, true))
+        constexpr size_t lengthFieldOptions[] = { sizeof(uint16), sizeof(uint32) };
+        bool parsed = false;
+        for (size_t lengthBytes : lengthFieldOptions)
         {
-            if (!TryRewrite(true, false))
+            if (parsed)
+                break;
+
+            if (TryRewrite(true, true, lengthBytes))
             {
-                if (!TryRewrite(false, true))
-                {
-                    if (!TryRewrite(false, false))
-                        return false;
-                }
+                parsed = true;
+                continue;
+            }
+
+            if (TryRewrite(true, false, lengthBytes))
+            {
+                parsed = true;
+                continue;
+            }
+
+            if (TryRewrite(false, true, lengthBytes))
+            {
+                parsed = true;
+                continue;
+            }
+
+            if (TryRewrite(false, false, lengthBytes))
+            {
+                parsed = true;
+                continue;
             }
         }
+
+        if (!parsed)
+            return false;
 
         if (!modified)
             return false;

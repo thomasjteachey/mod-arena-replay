@@ -16,6 +16,12 @@
 #include "ScriptMgr.h"
 #include <iomanip>
 #include <unordered_map>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <limits>
+#include <vector>
+#include <zlib.h>
 
 std::vector<Opcodes> watchList =
 {
@@ -89,13 +95,583 @@ SMSG_PLAY_SPELL_VISUAL
 CMSG_ATTACKSWING
 CMSG_ATTACKSTOP*/
 
-struct PacketRecord { uint32 timestamp; WorldPacket packet; };
-struct MatchRecord { BattlegroundTypeId typeId; uint8 arenaTypeId; uint32 mapId; std::deque<PacketRecord> packets; };
+struct PacketRecord { uint32 timestamp; WorldPacket packet; uint64 sourceGuid = 0; };
+struct MatchRecord {
+    BattlegroundTypeId typeId;
+    uint8 arenaTypeId;
+    uint32 mapId;
+    std::deque<PacketRecord> packets;
+    std::vector<uint64> participantGuids;
+};
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
 std::unordered_map<uint32, MatchRecord> records;
 std::unordered_map<uint64, MatchRecord> loadedReplays;
 std::unordered_map<uint32, uint32> bgReplayIds;
 std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
+
+namespace
+{
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid);
+
+    std::array<uint8, 8> GetGuidBytes(uint64 guid)
+    {
+        std::array<uint8, 8> bytes{};
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = uint8((guid >> (i * 8)) & 0xFF);
+
+        return bytes;
+    }
+
+    uint64 BuildGuidFromBytes(std::array<uint8, 8> const& bytes)
+    {
+        uint64 value = 0;
+        for (size_t i = 0; i < bytes.size(); ++i)
+            value |= (uint64(bytes[i]) << (i * 8));
+
+        return value;
+    }
+
+    bool ReplayMetadataContainsGuid(MatchRecord const& record, uint64 guid)
+    {
+        if (std::find(record.participantGuids.begin(), record.participantGuids.end(), guid) != record.participantGuids.end())
+            return true;
+
+        for (PacketRecord const& packet : record.packets)
+        {
+            if (packet.sourceGuid == guid)
+                return true;
+        }
+
+        return false;
+    }
+
+    std::vector<uint8> GetPackedGuidBytes(uint64 guid)
+    {
+        std::array<uint8, 8> guidBytes = GetGuidBytes(guid);
+        uint8 mask = 0;
+        std::vector<uint8> packed;
+        packed.reserve(9);
+
+        for (uint8 i = 0; i < guidBytes.size(); ++i)
+        {
+            if (guidBytes[i] == 0)
+                continue;
+
+            mask |= (1u << i);
+            packed.push_back(guidBytes[i]);
+        }
+
+        if (mask == 0)
+            return {};
+
+        packed.insert(packed.begin(), mask);
+        return packed;
+    }
+
+    bool ReplaceSequence(std::vector<uint8>& buffer, std::vector<uint8> const& from, std::vector<uint8> const& to)
+    {
+        if (from.empty() || from == to)
+            return false;
+
+        bool modified = false;
+        for (size_t i = 0; i + from.size() <= buffer.size();)
+        {
+            if (std::memcmp(buffer.data() + i, from.data(), from.size()) == 0)
+            {
+                buffer.erase(buffer.begin() + i, buffer.begin() + i + from.size());
+                buffer.insert(buffer.begin() + i, to.begin(), to.end());
+                i += to.size();
+                modified = true;
+            }
+            else
+            {
+                ++i;
+            }
+        }
+
+        return modified;
+    }
+
+    template <typename T>
+    bool ReadLittleEndian(std::vector<uint8> const& data, size_t& offset, T& value)
+    {
+        if (offset + sizeof(T) > data.size())
+            return false;
+
+        value = 0;
+        for (size_t i = 0; i < sizeof(T); ++i)
+            value |= (T(data[offset + i]) << (i * 8));
+
+        offset += sizeof(T);
+        return true;
+    }
+
+    template <typename T>
+    void WriteLittleEndian(std::vector<uint8>& buffer, T value)
+    {
+        for (size_t i = 0; i < sizeof(T); ++i)
+            buffer.push_back(uint8((value >> (i * 8)) & 0xFF));
+    }
+
+    enum class MultipacketCountField : uint8
+    {
+        None,
+        Count16,
+        Count32
+    };
+
+    enum class MultipacketHeaderOrder : uint8
+    {
+        OpcodeThenLength,
+        LengthThenOpcode
+    };
+
+    enum class MultipacketLengthField : uint8
+    {
+        Length16,
+        Length32
+    };
+
+    struct MultipacketLayout
+    {
+        MultipacketCountField countField;
+        MultipacketHeaderOrder headerOrder;
+        MultipacketLengthField lengthField;
+    };
+
+    bool ReadMultipacketLength(std::vector<uint8> const& data, size_t& offset, MultipacketLengthField lengthField, uint32& length)
+    {
+        if (lengthField == MultipacketLengthField::Length16)
+        {
+            uint16 value = 0;
+            if (!ReadLittleEndian<uint16>(data, offset, value))
+                return false;
+
+            length = value;
+            return true;
+        }
+
+        uint32 value = 0;
+        if (!ReadLittleEndian<uint32>(data, offset, value))
+            return false;
+
+        length = value;
+        return true;
+    }
+
+    bool TryParseMultipacketPayload(std::vector<uint8> const& payload, MultipacketLayout layout, std::vector<WorldPacket>& embeddedPackets)
+    {
+        size_t offset = 0;
+        uint32 declaredCount = 0;
+
+        if (layout.countField == MultipacketCountField::Count16)
+        {
+            uint16 count = 0;
+            if (!ReadLittleEndian<uint16>(payload, offset, count))
+                return false;
+
+            declaredCount = count;
+        }
+        else if (layout.countField == MultipacketCountField::Count32)
+        {
+            uint32 count = 0;
+            if (!ReadLittleEndian<uint32>(payload, offset, count))
+                return false;
+
+            declaredCount = count;
+        }
+
+        while (offset < payload.size())
+        {
+            uint16 opcode = 0;
+            uint32 length = 0;
+
+            if (layout.headerOrder == MultipacketHeaderOrder::OpcodeThenLength)
+            {
+                if (!ReadLittleEndian<uint16>(payload, offset, opcode))
+                    return false;
+
+                if (!ReadMultipacketLength(payload, offset, layout.lengthField, length))
+                    return false;
+            }
+            else
+            {
+                if (!ReadMultipacketLength(payload, offset, layout.lengthField, length))
+                    return false;
+
+                if (!ReadLittleEndian<uint16>(payload, offset, opcode))
+                    return false;
+            }
+
+            if (payload.size() - offset < length)
+                return false;
+
+            WorldPacket embedded(static_cast<Opcodes>(opcode), length);
+            if (length > 0)
+                embedded.append(payload.data() + offset, length);
+
+            offset += length;
+            embeddedPackets.push_back(std::move(embedded));
+
+            if (declaredCount != 0 && embeddedPackets.size() > declaredCount)
+                return false;
+        }
+
+        if (layout.countField != MultipacketCountField::None && embeddedPackets.size() != declaredCount)
+            return false;
+
+        return offset == payload.size();
+    }
+
+    bool BuildMultipacketPayload(MultipacketLayout layout, std::vector<WorldPacket> const& embeddedPackets, std::vector<uint8>& output)
+    {
+        output.clear();
+
+        if (layout.countField == MultipacketCountField::Count16)
+        {
+            if (embeddedPackets.size() > std::numeric_limits<uint16>::max())
+                return false;
+
+            WriteLittleEndian<uint16>(output, static_cast<uint16>(embeddedPackets.size()));
+        }
+        else if (layout.countField == MultipacketCountField::Count32)
+        {
+            WriteLittleEndian<uint32>(output, static_cast<uint32>(embeddedPackets.size()));
+        }
+
+        for (WorldPacket const& embedded : embeddedPackets)
+        {
+            uint32 length = static_cast<uint32>(embedded.size());
+            if (layout.lengthField == MultipacketLengthField::Length16 && length > std::numeric_limits<uint16>::max())
+                return false;
+
+            auto writeLength = [&](uint32 len)
+            {
+                if (layout.lengthField == MultipacketLengthField::Length16)
+                    WriteLittleEndian<uint16>(output, static_cast<uint16>(len));
+                else
+                    WriteLittleEndian<uint32>(output, len);
+            };
+
+            if (layout.headerOrder == MultipacketHeaderOrder::OpcodeThenLength)
+            {
+                WriteLittleEndian<uint16>(output, static_cast<uint16>(embedded.GetOpcode()));
+                writeLength(length);
+            }
+            else
+            {
+                writeLength(length);
+                WriteLittleEndian<uint16>(output, static_cast<uint16>(embedded.GetOpcode()));
+            }
+
+            if (length > 0)
+                output.insert(output.end(), embedded.contents(), embedded.contents() + length);
+        }
+
+        return true;
+    }
+
+    bool RewriteMultipacketPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> payload(contents, contents + packetSize);
+
+        std::array<MultipacketCountField, 3> countFields = {
+            MultipacketCountField::None,
+            MultipacketCountField::Count16,
+            MultipacketCountField::Count32
+        };
+        std::array<MultipacketHeaderOrder, 2> headerOrders = {
+            MultipacketHeaderOrder::OpcodeThenLength,
+            MultipacketHeaderOrder::LengthThenOpcode
+        };
+        std::array<MultipacketLengthField, 2> lengthFields = {
+            MultipacketLengthField::Length16,
+            MultipacketLengthField::Length32
+        };
+
+
+        for (MultipacketCountField countField : countFields)
+        {
+            for (MultipacketHeaderOrder headerOrder : headerOrders)
+            {
+                for (MultipacketLengthField lengthField : lengthFields)
+                {
+                    MultipacketLayout layout{ countField, headerOrder, lengthField };
+                    std::vector<WorldPacket> embeddedPackets;
+                    if (!TryParseMultipacketPayload(payload, layout, embeddedPackets))
+                        continue;
+
+                    bool modified = false;
+                    for (WorldPacket& embedded : embeddedPackets)
+                        modified |= ReplaceGuidInPacket(embedded, fromGuid, toGuid);
+
+                    if (!modified)
+                        continue;
+
+                    std::vector<uint8> rebuilt;
+                    if (!BuildMultipacketPayload(layout, embeddedPackets, rebuilt))
+                        continue;
+
+                    WorldPacket updated(packet.GetOpcode(), rebuilt.size());
+                    updated.append(rebuilt.data(), rebuilt.size());
+                    packet = std::move(updated);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool Decompress(std::vector<uint8> const& input, std::vector<uint8>& output)
+    {
+        if (input.size() <= sizeof(uint32))
+            return false;
+
+        uint32 decompressedSize;
+        std::memcpy(&decompressedSize, input.data(), sizeof(uint32));
+        if (decompressedSize == 0)
+            return false;
+
+        output.resize(decompressedSize);
+
+        z_stream stream;
+        std::memset(&stream, 0, sizeof(stream));
+        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(input.data() + sizeof(uint32)));
+        stream.avail_in = static_cast<uInt>(input.size() - sizeof(uint32));
+        stream.next_out = output.data();
+        stream.avail_out = static_cast<uInt>(output.size());
+
+        int ret = inflateInit(&stream);
+        if (ret != Z_OK)
+            return false;
+
+        ret = inflate(&stream, Z_FINISH);
+        inflateEnd(&stream);
+        if (ret != Z_STREAM_END)
+            return false;
+
+        output.resize(stream.total_out);
+        return true;
+    }
+
+    bool Compress(std::vector<uint8> const& input, std::vector<uint8>& output)
+    {
+        if (input.empty())
+            return false;
+
+        uLongf bound = compressBound(static_cast<uLong>(input.size()));
+        output.resize(sizeof(uint32) + bound);
+
+        uint32 inputSize = static_cast<uint32>(input.size());
+        std::memcpy(output.data(), &inputSize, sizeof(uint32));
+
+        z_stream stream;
+        std::memset(&stream, 0, sizeof(stream));
+        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(input.data()));
+        stream.avail_in = static_cast<uInt>(input.size());
+        stream.next_out = output.data() + sizeof(uint32);
+        stream.avail_out = static_cast<uInt>(bound);
+
+        int ret = deflateInit(&stream, Z_DEFAULT_COMPRESSION);
+        if (ret != Z_OK)
+            return false;
+
+        ret = deflate(&stream, Z_FINISH);
+        deflateEnd(&stream);
+        if (ret != Z_STREAM_END)
+            return false;
+
+        output.resize(sizeof(uint32) + stream.total_out);
+        return true;
+    }
+
+    uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
+    {
+        auto originalBytes = GetGuidBytes(originalGuid);
+        std::vector<size_t> nonZeroIndices;
+        nonZeroIndices.reserve(originalBytes.size());
+        for (size_t i = 0; i < originalBytes.size(); ++i)
+        {
+            if (originalBytes[i] != 0)
+                nonZeroIndices.push_back(i);
+        }
+
+        if (nonZeroIndices.empty())
+            return originalGuid;
+
+        auto BuildCandidate = [&](std::vector<uint16> const& offsets)
+        {
+            std::array<uint8, 8> candidateBytes = originalBytes;
+            for (size_t i = 0; i < nonZeroIndices.size(); ++i)
+            {
+                size_t byteIndex = nonZeroIndices[i];
+                uint16 base = originalBytes[byteIndex];
+                uint16 offset = offsets[i];
+                uint16 value = static_cast<uint16>(((base - 1u + offset) % 255u) + 1u);
+                candidateBytes[byteIndex] = static_cast<uint8>(value);
+            }
+
+            return BuildGuidFromBytes(candidateBytes);
+        };
+
+        std::vector<uint16> offsets(nonZeroIndices.size(), 0);
+        while (true)
+        {
+            size_t position = 0;
+            while (position < offsets.size())
+            {
+                if (offsets[position] < 254)
+                {
+                    ++offsets[position];
+                    break;
+                }
+
+                offsets[position] = 0;
+                ++position;
+            }
+
+            if (position == offsets.size())
+                break;
+
+            bool allZero = std::all_of(offsets.begin(), offsets.end(), [](uint16 value) { return value == 0; });
+            if (allZero)
+                continue;
+
+            uint64 candidate = BuildCandidate(offsets);
+            if (candidate == 0 || candidate == originalGuid)
+                continue;
+
+            if (!ReplayMetadataContainsGuid(record, candidate))
+                return candidate;
+        }
+
+        uint64 candidate = originalGuid;
+        do
+        {
+            ++candidate;
+        } while (candidate == 0 || ReplayMetadataContainsGuid(record, candidate));
+
+        return candidate;
+    }
+
+    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
+    {
+        if (payload.empty())
+            return false;
+
+        auto fromBytesArray = GetGuidBytes(fromGuid);
+        auto toBytesArray = GetGuidBytes(toGuid);
+        std::vector<uint8> fromBytes(fromBytesArray.begin(), fromBytesArray.end());
+        std::vector<uint8> toBytes(toBytesArray.begin(), toBytesArray.end());
+        std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
+        std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
+
+        bool modified = ReplaceSequence(payload, fromBytes, toBytes);
+
+        if (!fromPacked.empty() && !toPacked.empty())
+            modified |= ReplaceSequence(payload, fromPacked, toPacked);
+
+        return modified;
+    }
+
+    bool RewriteCompressedPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        std::vector<uint8> decompressed;
+
+        if (!Decompress(buffer, decompressed))
+            return false;
+
+        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
+            return false;
+
+        if (!Compress(decompressed, buffer))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), buffer.size());
+        updated.append(buffer.data(), buffer.size());
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool RewriteRawPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), buffer.size());
+        updated.append(buffer.data(), buffer.size());
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        if (fromGuid == toGuid)
+            return false;
+
+        if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
+        {
+            if (RewriteMultipacketPacket(packet, fromGuid, toGuid))
+                return true;
+        }
+
+        if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+            return RewriteCompressedPacket(packet, fromGuid, toGuid);
+
+        return RewriteRawPacket(packet, fromGuid, toGuid);
+    }
+
+    void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)
+    {
+        if (viewerGuid == 0)
+            return;
+
+        uint64 ghostGuid = GenerateGhostGuid(viewerGuid, record);
+        if (ghostGuid == viewerGuid)
+            return;
+
+        for (uint64& guid : record.participantGuids)
+        {
+            if (guid == viewerGuid)
+                guid = ghostGuid;
+        }
+
+        for (PacketRecord& packet : record.packets)
+        {
+            if (packet.sourceGuid == viewerGuid)
+                packet.sourceGuid = ghostGuid;
+
+            ReplaceGuidInPacket(packet.packet, viewerGuid, ghostGuid);
+        }
+    }
+}
 
 class ArenaReplayServerScript : public ServerScript
 {
@@ -151,7 +727,7 @@ public:
         record.arenaTypeId = bg->GetArenaType();
         record.mapId = bg->GetMapId();
         // push back packet inside queue of matchId 0
-        record.packets.push_back({ timestamp, /* copy */ WorldPacket(packet) });
+        record.packets.push_back({ timestamp, /* copy */ WorldPacket(packet), session->GetPlayer()->GetGUID().GetRawValue() });
         return true;
     }
 };
@@ -224,12 +800,21 @@ public:
         }
 
         //send replay data to spectator
+        const uint64 replayerGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
             if (bg->GetPlayers().empty())
                 break;
 
-            WorldPacket* myPacket = &match.packets.front().packet;
+            PacketRecord const& packetRecord = match.packets.front();
+            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == replayerGuid)
+            {
+                match.packets.pop_front();
+                continue;
+            }
+
+            WorldPacket const* myPacket = &packetRecord.packet;
             Player* replayer = bg->GetPlayers().begin()->second;
             replayer->GetSession()->SendPacket(myPacket);
             match.packets.pop_front();
@@ -313,16 +898,25 @@ public:
         ArenaReplayByteBuffer buffer;
         uint32 headerSize;
         uint32 timestamp;
-        for (auto it : match.packets)
+        for (auto const& packetRecord : match.packets)
         {
-            headerSize = it.packet.size(); //header 4Bytes packet size
-            timestamp = it.timestamp;
+            headerSize = packetRecord.packet.size(); //header 4Bytes packet size
+            timestamp = packetRecord.timestamp;
 
-            buffer << headerSize; // 4 bytes
+            const bool hasSourceGuid = packetRecord.sourceGuid != 0;
+            uint32 sizeWithFlag = headerSize;
+            if (hasSourceGuid)
+                sizeWithFlag |= 0x80000000u;
+
+            buffer << sizeWithFlag; // 4 bytes
             buffer << timestamp; // 4 bytes
-            buffer << it.packet.GetOpcode(); // 2 bytes
+            buffer << packetRecord.packet.GetOpcode(); // 2 bytes
+
+            if (hasSourceGuid)
+                buffer << packetRecord.sourceGuid; // 8 bytes
+
             if (headerSize > 0)
-                buffer.append(it.packet.contents(), it.packet.size()); // headerSize bytes
+                buffer.append(packetRecord.packet.contents(), packetRecord.packet.size()); // headerSize bytes
         }
 
         uint32 teamWinnerRating = 0;
@@ -785,6 +1379,38 @@ private:
         return iconsTextTeam;
     }
 
+    void AppendPlayerGuidsFromList(std::vector<uint64>& guids, std::string const& guidList)
+    {
+        if (guidList.empty())
+            return;
+
+        std::stringstream ss(guidList);
+        std::string entry;
+        while (std::getline(ss, entry, ','))
+        {
+            auto begin = entry.find_first_not_of(" \t\n\r");
+            if (begin == std::string::npos)
+                continue;
+
+            auto end = entry.find_last_not_of(" \t\n\r");
+            if (end == std::string::npos)
+                continue;
+
+            std::string trimmed = entry.substr(begin, end - begin + 1);
+            if (trimmed.empty())
+                continue;
+
+            try
+            {
+                guids.push_back(std::stoull(trimmed));
+            }
+            catch (...)
+            {
+                continue;
+            }
+        }
+    }
+
     struct ReplayInfo
     {
         uint32 matchId;
@@ -1066,7 +1692,7 @@ private:
 
     bool loadReplayDataForPlayer(Player* p, uint32 matchId)
     {
-        QueryResult result = CharacterDatabase.Query("SELECT id, arenaTypeId, typeId, contentSize, contents, mapId, timesWatched FROM character_arena_replays WHERE id = {}", matchId);
+        QueryResult result = CharacterDatabase.Query("SELECT id, arenaTypeId, typeId, contentSize, contents, mapId, timesWatched, winnerPlayerGuids, loserPlayerGuids FROM character_arena_replays WHERE id = {}", matchId);
         if (!result)
         {
             ChatHandler(p->GetSession()).PSendSysMessage("Replay data not found.");
@@ -1088,7 +1714,15 @@ private:
         CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
 
         MatchRecord record;
+        if (!fields[7].IsNull())
+            AppendPlayerGuidsFromList(record.participantGuids, fields[7].Get<std::string>());
+
+        if (!fields[8].IsNull())
+            AppendPlayerGuidsFromList(record.participantGuids, fields[8].Get<std::string>());
+
         deserializeMatchData(record, fields);
+
+        RemapReplayGuidForViewer(record, p->GetGUID().GetRawValue());
 
         loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
         return true;
@@ -1098,20 +1732,45 @@ private:
     {
         record.arenaTypeId = uint8(fields[1].Get<uint32>());
         record.typeId = BattlegroundTypeId(fields[2].Get<uint32>());
-        std::vector<uint8> data = *Acore::Encoding::Base32::Decode(fields[4].Get<std::string>());
+        auto encodedData = Acore::Encoding::Base32::Decode(fields[4].Get<std::string>());
+        if (!encodedData)
+            return;
+
         record.mapId = uint32(fields[5].Get<uint32>());
         ByteBuffer buffer;
-        buffer.append(&data[0], data.size());
+        if (!encodedData->empty())
+            buffer.append(encodedData->data(), encodedData->size());
 
         /** deserialize replay binary data **/
-        uint32 packetSize;
+        uint32 packedPacketSize;
         uint32 packetTimestamp;
         uint16 opcode;
-        while (buffer.rpos() <= buffer.size() - 1)
+        while (buffer.rpos() < buffer.size())
         {
-            buffer >> packetSize;
+            if (buffer.size() - buffer.rpos() < sizeof(uint32))
+                break;
+
+            buffer >> packedPacketSize;
+            bool hasSourceGuid = (packedPacketSize & 0x80000000u) != 0;
+            uint32 packetSize = packedPacketSize & 0x7FFFFFFFu;
+
+            if (buffer.size() - buffer.rpos() < sizeof(uint32) + sizeof(uint16))
+                break;
+
             buffer >> packetTimestamp;
             buffer >> opcode;
+
+            uint64 sourceGuid = 0;
+            if (hasSourceGuid)
+            {
+                if (buffer.size() - buffer.rpos() < sizeof(uint64))
+                    break;
+
+                buffer >> sourceGuid;
+            }
+
+            if (buffer.size() - buffer.rpos() < packetSize)
+                break;
 
             WorldPacket packet(opcode, packetSize);
 
@@ -1122,7 +1781,7 @@ private:
                 packet.append(&tmp[0], packetSize);
             }
 
-            record.packets.push_back({ packetTimestamp, packet });
+            record.packets.push_back({ packetTimestamp, packet, sourceGuid });
         }
     }
 };

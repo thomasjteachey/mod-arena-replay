@@ -20,7 +20,6 @@
 #include <array>
 #include <cstring>
 #include <vector>
-#include <limits>
 #include <zlib.h>
 
 std::vector<Opcodes> watchList =
@@ -120,6 +119,15 @@ namespace
             bytes[i] = uint8((guid >> (i * 8)) & 0xFF);
 
         return bytes;
+    }
+
+    uint64 BuildGuidFromBytes(std::array<uint8, 8> const& bytes)
+    {
+        uint64 value = 0;
+        for (size_t i = 0; i < bytes.size(); ++i)
+            value |= (uint64(bytes[i]) << (i * 8));
+
+        return value;
     }
 
     bool ReplayMetadataContainsGuid(MatchRecord const& record, uint64 guid)
@@ -248,6 +256,64 @@ namespace
 
     uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
     {
+        auto originalBytes = GetGuidBytes(originalGuid);
+        std::vector<size_t> nonZeroIndices;
+        nonZeroIndices.reserve(originalBytes.size());
+        for (size_t i = 0; i < originalBytes.size(); ++i)
+        {
+            if (originalBytes[i] != 0)
+                nonZeroIndices.push_back(i);
+        }
+
+        if (nonZeroIndices.empty())
+            return originalGuid;
+
+        auto BuildCandidate = [&](std::vector<uint16> const& offsets)
+        {
+            std::array<uint8, 8> candidateBytes = originalBytes;
+            for (size_t i = 0; i < nonZeroIndices.size(); ++i)
+            {
+                size_t byteIndex = nonZeroIndices[i];
+                uint16 base = originalBytes[byteIndex];
+                uint16 offset = offsets[i];
+                uint16 value = static_cast<uint16>(((base - 1u + offset) % 255u) + 1u);
+                candidateBytes[byteIndex] = static_cast<uint8>(value);
+            }
+
+            return BuildGuidFromBytes(candidateBytes);
+        };
+
+        std::vector<uint16> offsets(nonZeroIndices.size(), 0);
+        while (true)
+        {
+            size_t position = 0;
+            while (position < offsets.size())
+            {
+                if (offsets[position] < 254)
+                {
+                    ++offsets[position];
+                    break;
+                }
+
+                offsets[position] = 0;
+                ++position;
+            }
+
+            if (position == offsets.size())
+                break;
+
+            bool allZero = std::all_of(offsets.begin(), offsets.end(), [](uint16 value) { return value == 0; });
+            if (allZero)
+                continue;
+
+            uint64 candidate = BuildCandidate(offsets);
+            if (candidate == 0 || candidate == originalGuid)
+                continue;
+
+            if (!ReplayMetadataContainsGuid(record, candidate))
+                return candidate;
+        }
+
         uint64 candidate = originalGuid;
         do
         {
@@ -325,234 +391,10 @@ namespace
         return true;
     }
 
-    uint16 ReadUInt16(uint8 const* ptr)
-    {
-        return uint16(ptr[0] | (ptr[1] << 8));
-    }
-
-    uint32 ReadUInt32(uint8 const* ptr)
-    {
-        return uint32(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24));
-    }
-
-    void AppendUInt16(std::vector<uint8>& buffer, uint16 value)
-    {
-        buffer.push_back(uint8(value & 0xFF));
-        buffer.push_back(uint8((value >> 8) & 0xFF));
-    }
-
-    void AppendUInt32(std::vector<uint8>& buffer, uint32 value)
-    {
-        buffer.push_back(uint8(value & 0xFF));
-        buffer.push_back(uint8((value >> 8) & 0xFF));
-        buffer.push_back(uint8((value >> 16) & 0xFF));
-        buffer.push_back(uint8((value >> 24) & 0xFF));
-    }
-
-    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid,
-        bool hasLeadingCount, size_t countFieldBytes, bool opcodeFirst, size_t lengthFieldBytes,
-        std::vector<uint8>& rebuilt, bool& modified)
-    {
-        rebuilt.clear();
-        modified = false;
-
-        size_t offset = 0;
-        uint32 expectedCount = 0;
-        uint32 parsedCount = 0;
-
-        if (hasLeadingCount)
-        {
-            if (countFieldBytes != sizeof(uint16) && countFieldBytes != sizeof(uint32))
-                return false;
-
-            if (packetSize < countFieldBytes)
-                return false;
-
-            if (countFieldBytes == sizeof(uint16))
-            {
-                expectedCount = ReadUInt16(contents);
-                AppendUInt16(rebuilt, static_cast<uint16>(expectedCount));
-            }
-            else
-            {
-                expectedCount = ReadUInt32(contents);
-                AppendUInt32(rebuilt, expectedCount);
-            }
-
-            offset += countFieldBytes;
-        }
-
-        while (offset < packetSize)
-        {
-            if (lengthFieldBytes != sizeof(uint16) && lengthFieldBytes != sizeof(uint32))
-                return false;
-
-            size_t headerSize = sizeof(uint16) + lengthFieldBytes;
-            if (packetSize - offset < headerSize)
-                return false;
-
-            uint16 opcode = 0;
-            uint32 length = 0;
-
-            if (opcodeFirst)
-            {
-                opcode = ReadUInt16(contents + offset);
-                offset += sizeof(uint16);
-
-                length = lengthFieldBytes == sizeof(uint16) ? ReadUInt16(contents + offset) : ReadUInt32(contents + offset);
-                offset += lengthFieldBytes;
-            }
-            else
-            {
-                length = lengthFieldBytes == sizeof(uint16) ? ReadUInt16(contents + offset) : ReadUInt32(contents + offset);
-                offset += lengthFieldBytes;
-
-                opcode = ReadUInt16(contents + offset);
-                offset += sizeof(uint16);
-            }
-
-            if (packetSize - offset < length)
-                return false;
-
-            WorldPacket inner(opcode, length);
-            if (length > 0)
-                inner.append(contents + offset, length);
-
-            offset += length;
-
-            if (ReplaceGuidInPacket(inner, fromGuid, toGuid))
-                modified = true;
-
-            uint32 newLength = static_cast<uint32>(inner.size());
-            if (lengthFieldBytes == sizeof(uint16) && newLength > std::numeric_limits<uint16>::max())
-                return false;
-
-            if (opcodeFirst)
-            {
-                AppendUInt16(rebuilt, opcode);
-                if (lengthFieldBytes == sizeof(uint16))
-                    AppendUInt16(rebuilt, static_cast<uint16>(newLength));
-                else
-                    AppendUInt32(rebuilt, newLength);
-            }
-            else
-            {
-                if (lengthFieldBytes == sizeof(uint16))
-                    AppendUInt16(rebuilt, static_cast<uint16>(newLength));
-                else
-                    AppendUInt32(rebuilt, newLength);
-                AppendUInt16(rebuilt, opcode);
-            }
-
-            if (newLength > 0)
-            {
-                uint8 const* innerData = inner.contents();
-                rebuilt.insert(rebuilt.end(), innerData, innerData + newLength);
-            }
-
-            ++parsedCount;
-        }
-
-        if (hasLeadingCount && parsedCount != expectedCount)
-            return false;
-
-        if (!hasLeadingCount && parsedCount == 0)
-            return false;
-
-        return true;
-    }
-
-    bool RewriteMultipacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
-    {
-        size_t packetSize = packet.size();
-        if (packetSize < sizeof(uint16) * 2)
-            return false;
-
-        uint8 const* contents = packet.contents();
-        if (!contents)
-            return false;
-
-        std::vector<uint8> rebuilt;
-        rebuilt.reserve(packetSize);
-        bool modified = false;
-
-        auto TryRewrite = [&](bool hasLeadingCount, size_t countFieldBytes, bool opcodeFirst, size_t lengthFieldBytes) -> bool
-        {
-            std::vector<uint8> candidate;
-            candidate.reserve(packetSize);
-            bool candidateModified = false;
-
-            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, countFieldBytes, opcodeFirst, lengthFieldBytes, candidate, candidateModified))
-                return false;
-
-            if (!candidateModified)
-                return true;
-
-            rebuilt = std::move(candidate);
-            modified = true;
-            return true;
-        };
-
-        constexpr size_t lengthFieldOptions[] = { sizeof(uint16), sizeof(uint32) };
-        constexpr size_t countFieldOptions[] = { sizeof(uint16), sizeof(uint32) };
-        bool parsed = false;
-        for (size_t lengthBytes : lengthFieldOptions)
-        {
-            if (parsed)
-                break;
-
-            for (size_t countBytes : countFieldOptions)
-            {
-                if (TryRewrite(true, countBytes, true, lengthBytes))
-                {
-                    parsed = true;
-                    break;
-                }
-
-                if (TryRewrite(true, countBytes, false, lengthBytes))
-                {
-                    parsed = true;
-                    break;
-                }
-            }
-
-            if (parsed)
-                continue;
-
-            if (TryRewrite(false, 0, true, lengthBytes))
-            {
-                parsed = true;
-                continue;
-            }
-
-            if (TryRewrite(false, 0, false, lengthBytes))
-            {
-                parsed = true;
-                continue;
-            }
-        }
-
-        if (!parsed)
-            return false;
-
-        if (!modified)
-            return false;
-
-        WorldPacket updated(packet.GetOpcode(), rebuilt.size());
-        if (!rebuilt.empty())
-            updated.append(rebuilt.data(), rebuilt.size());
-
-        packet = std::move(updated);
-        return true;
-    }
-
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
     {
         if (fromGuid == toGuid)
             return false;
-
-        if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
-            return RewriteMultipacket(packet, fromGuid, toGuid);
 
         if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
             return RewriteCompressedPacket(packet, fromGuid, toGuid);

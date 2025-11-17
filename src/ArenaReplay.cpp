@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <zlib.h>
 
@@ -189,6 +190,245 @@ namespace
         }
 
         return modified;
+    }
+
+    template <typename T>
+    bool ReadLittleEndian(std::vector<uint8> const& data, size_t& offset, T& value)
+    {
+        if (offset + sizeof(T) > data.size())
+            return false;
+
+        value = 0;
+        for (size_t i = 0; i < sizeof(T); ++i)
+            value |= (T(data[offset + i]) << (i * 8));
+
+        offset += sizeof(T);
+        return true;
+    }
+
+    template <typename T>
+    void WriteLittleEndian(std::vector<uint8>& buffer, T value)
+    {
+        for (size_t i = 0; i < sizeof(T); ++i)
+            buffer.push_back(uint8((value >> (i * 8)) & 0xFF));
+    }
+
+    enum class MultipacketCountField : uint8
+    {
+        None,
+        Count16,
+        Count32
+    };
+
+    enum class MultipacketHeaderOrder : uint8
+    {
+        OpcodeThenLength,
+        LengthThenOpcode
+    };
+
+    enum class MultipacketLengthField : uint8
+    {
+        Length16,
+        Length32
+    };
+
+    struct MultipacketLayout
+    {
+        MultipacketCountField countField;
+        MultipacketHeaderOrder headerOrder;
+        MultipacketLengthField lengthField;
+    };
+
+    bool ReadMultipacketLength(std::vector<uint8> const& data, size_t& offset, MultipacketLengthField lengthField, uint32& length)
+    {
+        if (lengthField == MultipacketLengthField::Length16)
+        {
+            uint16 value = 0;
+            if (!ReadLittleEndian<uint16>(data, offset, value))
+                return false;
+
+            length = value;
+            return true;
+        }
+
+        uint32 value = 0;
+        if (!ReadLittleEndian<uint32>(data, offset, value))
+            return false;
+
+        length = value;
+        return true;
+    }
+
+    bool TryParseMultipacketPayload(std::vector<uint8> const& payload, MultipacketLayout layout, std::vector<WorldPacket>& embeddedPackets)
+    {
+        size_t offset = 0;
+        uint32 declaredCount = 0;
+
+        if (layout.countField == MultipacketCountField::Count16)
+        {
+            uint16 count = 0;
+            if (!ReadLittleEndian<uint16>(payload, offset, count))
+                return false;
+
+            declaredCount = count;
+        }
+        else if (layout.countField == MultipacketCountField::Count32)
+        {
+            uint32 count = 0;
+            if (!ReadLittleEndian<uint32>(payload, offset, count))
+                return false;
+
+            declaredCount = count;
+        }
+
+        while (offset < payload.size())
+        {
+            uint16 opcode = 0;
+            uint32 length = 0;
+
+            if (layout.headerOrder == MultipacketHeaderOrder::OpcodeThenLength)
+            {
+                if (!ReadLittleEndian<uint16>(payload, offset, opcode))
+                    return false;
+
+                if (!ReadMultipacketLength(payload, offset, layout.lengthField, length))
+                    return false;
+            }
+            else
+            {
+                if (!ReadMultipacketLength(payload, offset, layout.lengthField, length))
+                    return false;
+
+                if (!ReadLittleEndian<uint16>(payload, offset, opcode))
+                    return false;
+            }
+
+            if (payload.size() - offset < length)
+                return false;
+
+            WorldPacket embedded(static_cast<Opcodes>(opcode), length);
+            if (length > 0)
+                embedded.append(payload.data() + offset, length);
+
+            offset += length;
+            embeddedPackets.push_back(std::move(embedded));
+
+            if (declaredCount != 0 && embeddedPackets.size() > declaredCount)
+                return false;
+        }
+
+        if (layout.countField != MultipacketCountField::None && embeddedPackets.size() != declaredCount)
+            return false;
+
+        return offset == payload.size();
+    }
+
+    bool BuildMultipacketPayload(MultipacketLayout layout, std::vector<WorldPacket> const& embeddedPackets, std::vector<uint8>& output)
+    {
+        output.clear();
+
+        if (layout.countField == MultipacketCountField::Count16)
+        {
+            if (embeddedPackets.size() > std::numeric_limits<uint16>::max())
+                return false;
+
+            WriteLittleEndian<uint16>(output, static_cast<uint16>(embeddedPackets.size()));
+        }
+        else if (layout.countField == MultipacketCountField::Count32)
+        {
+            WriteLittleEndian<uint32>(output, static_cast<uint32>(embeddedPackets.size()));
+        }
+
+        for (WorldPacket const& embedded : embeddedPackets)
+        {
+            uint32 length = static_cast<uint32>(embedded.size());
+            if (layout.lengthField == MultipacketLengthField::Length16 && length > std::numeric_limits<uint16>::max())
+                return false;
+
+            auto writeLength = [&](uint32 len)
+            {
+                if (layout.lengthField == MultipacketLengthField::Length16)
+                    WriteLittleEndian<uint16>(output, static_cast<uint16>(len));
+                else
+                    WriteLittleEndian<uint32>(output, len);
+            };
+
+            if (layout.headerOrder == MultipacketHeaderOrder::OpcodeThenLength)
+            {
+                WriteLittleEndian<uint16>(output, static_cast<uint16>(embedded.GetOpcode()));
+                writeLength(length);
+            }
+            else
+            {
+                writeLength(length);
+                WriteLittleEndian<uint16>(output, static_cast<uint16>(embedded.GetOpcode()));
+            }
+
+            if (length > 0)
+                output.insert(output.end(), embedded.contents(), embedded.contents() + length);
+        }
+
+        return true;
+    }
+
+    bool RewriteMultipacketPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> payload(contents, contents + packetSize);
+
+        std::array<MultipacketCountField, 3> countFields = {
+            MultipacketCountField::None,
+            MultipacketCountField::Count16,
+            MultipacketCountField::Count32
+        };
+        std::array<MultipacketHeaderOrder, 2> headerOrders = {
+            MultipacketHeaderOrder::OpcodeThenLength,
+            MultipacketHeaderOrder::LengthThenOpcode
+        };
+        std::array<MultipacketLengthField, 2> lengthFields = {
+            MultipacketLengthField::Length16,
+            MultipacketLengthField::Length32
+        };
+
+
+        for (MultipacketCountField countField : countFields)
+        {
+            for (MultipacketHeaderOrder headerOrder : headerOrders)
+            {
+                for (MultipacketLengthField lengthField : lengthFields)
+                {
+                    MultipacketLayout layout{ countField, headerOrder, lengthField };
+                    std::vector<WorldPacket> embeddedPackets;
+                    if (!TryParseMultipacketPayload(payload, layout, embeddedPackets))
+                        continue;
+
+                    bool modified = false;
+                    for (WorldPacket& embedded : embeddedPackets)
+                        modified |= ReplaceGuidInPacket(embedded, fromGuid, toGuid);
+
+                    if (!modified)
+                        continue;
+
+                    std::vector<uint8> rebuilt;
+                    if (!BuildMultipacketPayload(layout, embeddedPackets, rebuilt))
+                        continue;
+
+                    WorldPacket updated(packet.GetOpcode(), rebuilt.size());
+                    updated.append(rebuilt.data(), rebuilt.size());
+                    packet = std::move(updated);
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     bool Decompress(std::vector<uint8> const& input, std::vector<uint8>& output)
@@ -395,6 +635,12 @@ namespace
     {
         if (fromGuid == toGuid)
             return false;
+
+        if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
+        {
+            if (RewriteMultipacketPacket(packet, fromGuid, toGuid))
+                return true;
+        }
 
         if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
             return RewriteCompressedPacket(packet, fromGuid, toGuid);

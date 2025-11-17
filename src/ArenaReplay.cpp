@@ -349,23 +349,37 @@ namespace
         buffer.push_back(uint8((value >> 24) & 0xFF));
     }
 
-    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid, bool hasLeadingCount, bool opcodeFirst, size_t lengthFieldBytes, std::vector<uint8>& rebuilt, bool& modified)
+    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid,
+        bool hasLeadingCount, size_t countFieldBytes, bool opcodeFirst, size_t lengthFieldBytes,
+        std::vector<uint8>& rebuilt, bool& modified)
     {
         rebuilt.clear();
         modified = false;
 
         size_t offset = 0;
-        uint16 expectedCount = 0;
-        uint16 parsedCount = 0;
+        uint32 expectedCount = 0;
+        uint32 parsedCount = 0;
 
         if (hasLeadingCount)
         {
-            if (packetSize < sizeof(uint16))
+            if (countFieldBytes != sizeof(uint16) && countFieldBytes != sizeof(uint32))
                 return false;
 
-            expectedCount = ReadUInt16(contents);
-            AppendUInt16(rebuilt, expectedCount);
-            offset += sizeof(uint16);
+            if (packetSize < countFieldBytes)
+                return false;
+
+            if (countFieldBytes == sizeof(uint16))
+            {
+                expectedCount = ReadUInt16(contents);
+                AppendUInt16(rebuilt, static_cast<uint16>(expectedCount));
+            }
+            else
+            {
+                expectedCount = ReadUInt32(contents);
+                AppendUInt32(rebuilt, expectedCount);
+            }
+
+            offset += countFieldBytes;
         }
 
         while (offset < packetSize)
@@ -462,13 +476,13 @@ namespace
         rebuilt.reserve(packetSize);
         bool modified = false;
 
-        auto TryRewrite = [&](bool hasLeadingCount, bool opcodeFirst, size_t lengthFieldBytes) -> bool
+        auto TryRewrite = [&](bool hasLeadingCount, size_t countFieldBytes, bool opcodeFirst, size_t lengthFieldBytes) -> bool
         {
             std::vector<uint8> candidate;
             candidate.reserve(packetSize);
             bool candidateModified = false;
 
-            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, opcodeFirst, lengthFieldBytes, candidate, candidateModified))
+            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, countFieldBytes, opcodeFirst, lengthFieldBytes, candidate, candidateModified))
                 return false;
 
             if (!candidateModified)
@@ -480,31 +494,38 @@ namespace
         };
 
         constexpr size_t lengthFieldOptions[] = { sizeof(uint16), sizeof(uint32) };
+        constexpr size_t countFieldOptions[] = { sizeof(uint16), sizeof(uint32) };
         bool parsed = false;
         for (size_t lengthBytes : lengthFieldOptions)
         {
             if (parsed)
                 break;
 
-            if (TryRewrite(true, true, lengthBytes))
+            for (size_t countBytes : countFieldOptions)
+            {
+                if (TryRewrite(true, countBytes, true, lengthBytes))
+                {
+                    parsed = true;
+                    break;
+                }
+
+                if (TryRewrite(true, countBytes, false, lengthBytes))
+                {
+                    parsed = true;
+                    break;
+                }
+            }
+
+            if (parsed)
+                continue;
+
+            if (TryRewrite(false, 0, true, lengthBytes))
             {
                 parsed = true;
                 continue;
             }
 
-            if (TryRewrite(true, false, lengthBytes))
-            {
-                parsed = true;
-                continue;
-            }
-
-            if (TryRewrite(false, true, lengthBytes))
-            {
-                parsed = true;
-                continue;
-            }
-
-            if (TryRewrite(false, false, lengthBytes))
+            if (TryRewrite(false, 0, false, lengthBytes))
             {
                 parsed = true;
                 continue;

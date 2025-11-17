@@ -336,7 +336,7 @@ namespace
         buffer.push_back(uint8((value >> 8) & 0xFF));
     }
 
-    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid, bool hasLeadingCount, std::vector<uint8>& rebuilt, bool& modified)
+    bool RewriteMultipacketPayload(uint8 const* contents, size_t packetSize, uint64 fromGuid, uint64 toGuid, bool hasLeadingCount, bool opcodeFirst, std::vector<uint8>& rebuilt, bool& modified)
     {
         rebuilt.clear();
         modified = false;
@@ -363,11 +363,14 @@ namespace
             if (packetSize - offset < sizeof(uint16) * 2)
                 return false;
 
-            uint16 opcode = ReadUInt16(contents + offset);
+            uint16 first = ReadUInt16(contents + offset);
             offset += sizeof(uint16);
 
-            uint16 length = ReadUInt16(contents + offset);
+            uint16 second = ReadUInt16(contents + offset);
             offset += sizeof(uint16);
+
+            uint16 opcode = opcodeFirst ? first : second;
+            uint16 length = opcodeFirst ? second : first;
 
             if (packetSize - offset < length)
                 return false;
@@ -385,8 +388,16 @@ namespace
                 return false;
 
             uint16 newLength = static_cast<uint16>(inner.size());
-            AppendUInt16(rebuilt, opcode);
-            AppendUInt16(rebuilt, newLength);
+            if (opcodeFirst)
+            {
+                AppendUInt16(rebuilt, opcode);
+                AppendUInt16(rebuilt, newLength);
+            }
+            else
+            {
+                AppendUInt16(rebuilt, newLength);
+                AppendUInt16(rebuilt, opcode);
+            }
 
             if (newLength > 0)
             {
@@ -420,13 +431,13 @@ namespace
         rebuilt.reserve(packetSize);
         bool modified = false;
 
-        auto TryRewrite = [&](bool hasLeadingCount) -> bool
+        auto TryRewrite = [&](bool hasLeadingCount, bool opcodeFirst) -> bool
         {
             std::vector<uint8> candidate;
             candidate.reserve(packetSize);
             bool candidateModified = false;
 
-            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, candidate, candidateModified))
+            if (!RewriteMultipacketPayload(contents, packetSize, fromGuid, toGuid, hasLeadingCount, opcodeFirst, candidate, candidateModified))
                 return false;
 
             if (!candidateModified)
@@ -437,10 +448,16 @@ namespace
             return true;
         };
 
-        if (!TryRewrite(true))
+        if (!TryRewrite(true, true))
         {
-            if (!TryRewrite(false))
-                return false;
+            if (!TryRewrite(true, false))
+            {
+                if (!TryRewrite(false, true))
+                {
+                    if (!TryRewrite(false, false))
+                        return false;
+                }
+            }
         }
 
         if (!modified)

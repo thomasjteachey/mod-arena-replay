@@ -10,6 +10,7 @@
 #include "CharacterDatabase.h"
 #include "Chat.h"
 #include "Config.h"
+#include "Log.h"
 #include "Opcodes.h"
 #include "Player.h"
 #include "ScriptedGossip.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <vector>
 #include <zlib.h>
@@ -112,6 +114,7 @@ std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
 namespace
 {
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid);
+    bool PacketContainsGuid(WorldPacket const& packet, uint64 guid);
 
     std::array<uint8, 8> GetGuidBytes(uint64 guid)
     {
@@ -166,6 +169,14 @@ namespace
 
         packed.insert(packed.begin(), mask);
         return packed;
+    }
+
+    bool ContainsSequence(std::vector<uint8> const& buffer, std::vector<uint8> const& sequence)
+    {
+        if (sequence.empty() || buffer.size() < sequence.size())
+            return false;
+
+        return std::search(buffer.begin(), buffer.end(), sequence.begin(), sequence.end()) != buffer.end();
     }
 
     bool ReplaceSequence(std::vector<uint8>& buffer, std::vector<uint8> const& from, std::vector<uint8> const& to)
@@ -371,6 +382,45 @@ namespace
         return true;
     }
 
+    bool MultipacketPayloadContainsGuid(std::vector<uint8> const& payload, uint64 guid)
+    {
+        std::array<MultipacketCountField, 3> countFields = {
+            MultipacketCountField::None,
+            MultipacketCountField::Count16,
+            MultipacketCountField::Count32
+        };
+        std::array<MultipacketHeaderOrder, 2> headerOrders = {
+            MultipacketHeaderOrder::OpcodeThenLength,
+            MultipacketHeaderOrder::LengthThenOpcode
+        };
+        std::array<MultipacketLengthField, 2> lengthFields = {
+            MultipacketLengthField::Length16,
+            MultipacketLengthField::Length32
+        };
+
+        for (MultipacketCountField countField : countFields)
+        {
+            for (MultipacketHeaderOrder headerOrder : headerOrders)
+            {
+                for (MultipacketLengthField lengthField : lengthFields)
+                {
+                    MultipacketLayout layout{ countField, headerOrder, lengthField };
+                    std::vector<WorldPacket> embeddedPackets;
+                    if (!TryParseMultipacketPayload(payload, layout, embeddedPackets))
+                        continue;
+
+                    for (WorldPacket const& embedded : embeddedPackets)
+                    {
+                        if (PacketContainsGuid(embedded, guid))
+                            return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
     bool RewriteMultipacketPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
     {
         size_t packetSize = packet.size();
@@ -563,6 +613,24 @@ namespace
         return candidate;
     }
 
+    bool ContainsGuidSequences(std::vector<uint8> const& payload, uint64 guid)
+    {
+        if (payload.empty() || guid == 0)
+            return false;
+
+        auto bytesArray = GetGuidBytes(guid);
+        std::vector<uint8> raw(bytesArray.begin(), bytesArray.end());
+        std::vector<uint8> packed = GetPackedGuidBytes(guid);
+
+        if (ContainsSequence(payload, raw))
+            return true;
+
+        if (!packed.empty() && ContainsSequence(payload, packed))
+            return true;
+
+        return false;
+    }
+
     bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
     {
         if (payload.empty())
@@ -631,6 +699,41 @@ namespace
         return true;
     }
 
+    bool PacketContainsGuid(WorldPacket const& packet, uint64 guid)
+    {
+        if (guid == 0)
+            return false;
+
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+
+        if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+        {
+            std::vector<uint8> decompressed;
+            if (!Decompress(buffer, decompressed))
+                return true;
+
+            return ContainsGuidSequences(decompressed, guid);
+        }
+
+        if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
+        {
+            if (MultipacketPayloadContainsGuid(buffer, guid))
+                return true;
+
+            return ContainsGuidSequences(buffer, guid);
+        }
+
+        return ContainsGuidSequences(buffer, guid);
+    }
+
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
     {
         if (fromGuid == toGuid)
@@ -663,12 +766,26 @@ namespace
                 guid = ghostGuid;
         }
 
-        for (PacketRecord& packet : record.packets)
+        for (auto packetIt = record.packets.begin(); packetIt != record.packets.end();)
         {
+            PacketRecord& packet = *packetIt;
             if (packet.sourceGuid == viewerGuid)
                 packet.sourceGuid = ghostGuid;
 
-            ReplaceGuidInPacket(packet.packet, viewerGuid, ghostGuid);
+            if (ReplaceGuidInPacket(packet.packet, viewerGuid, ghostGuid))
+            {
+                ++packetIt;
+                continue;
+            }
+
+            if (!PacketContainsGuid(packet.packet, viewerGuid))
+            {
+                ++packetIt;
+                continue;
+            }
+
+            LOG_WARN("modules", "ArenaReplay: dropping packet {} for viewer {} because GUID remap failed", packet.packet.GetOpcode(), viewerGuid);
+            packetIt = record.packets.erase(packetIt);
         }
     }
 }

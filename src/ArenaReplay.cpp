@@ -513,37 +513,6 @@ namespace
         return true;
     }
 
-    bool Compress(std::vector<uint8> const& input, std::vector<uint8>& output)
-    {
-        if (input.empty())
-            return false;
-
-        uLongf bound = compressBound(static_cast<uLong>(input.size()));
-        output.resize(sizeof(uint32) + bound);
-
-        uint32 inputSize = static_cast<uint32>(input.size());
-        std::memcpy(output.data(), &inputSize, sizeof(uint32));
-
-        z_stream stream;
-        std::memset(&stream, 0, sizeof(stream));
-        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(input.data()));
-        stream.avail_in = static_cast<uInt>(input.size());
-        stream.next_out = output.data() + sizeof(uint32);
-        stream.avail_out = static_cast<uInt>(bound);
-
-        int ret = deflateInit(&stream, Z_DEFAULT_COMPRESSION);
-        if (ret != Z_OK)
-            return false;
-
-        ret = deflate(&stream, Z_FINISH);
-        deflateEnd(&stream);
-        if (ret != Z_STREAM_END)
-            return false;
-
-        output.resize(sizeof(uint32) + stream.total_out);
-        return true;
-    }
-
     uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
     {
         auto originalBytes = GetGuidBytes(originalGuid);
@@ -670,11 +639,10 @@ namespace
         if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
             return false;
 
-        if (!Compress(decompressed, buffer))
-            return false;
+        WorldPacket updated(SMSG_UPDATE_OBJECT, decompressed.size());
+        if (!decompressed.empty())
+            updated.append(decompressed.data(), decompressed.size());
 
-        WorldPacket updated(packet.GetOpcode(), buffer.size());
-        updated.append(buffer.data(), buffer.size());
         packet = std::move(updated);
         return true;
     }
@@ -722,6 +690,9 @@ namespace
 
             return ContainsGuidSequences(decompressed, guid);
         }
+
+        if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
+            return ContainsGuidSequences(buffer, guid);
 
         if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
         {

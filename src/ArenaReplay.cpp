@@ -620,6 +620,37 @@ namespace
         return modified;
     }
 
+    bool Compress(std::vector<uint8> const& input, std::vector<uint8>& output)
+    {
+        if (input.empty())
+            return false;
+
+        uint32 uncompressedSize = static_cast<uint32>(input.size());
+        uLongf maxCompressedSize = compressBound(uncompressedSize);
+        output.resize(sizeof(uint32) + maxCompressedSize);
+
+        std::memcpy(output.data(), &uncompressedSize, sizeof(uint32));
+
+        z_stream stream;
+        std::memset(&stream, 0, sizeof(stream));
+        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(input.data()));
+        stream.avail_in = static_cast<uInt>(input.size());
+        stream.next_out = output.data() + sizeof(uint32);
+        stream.avail_out = static_cast<uInt>(maxCompressedSize);
+
+        int ret = deflateInit(&stream, Z_BEST_SPEED);
+        if (ret != Z_OK)
+            return false;
+
+        ret = deflate(&stream, Z_FINISH);
+        deflateEnd(&stream);
+        if (ret != Z_STREAM_END)
+            return false;
+
+        output.resize(sizeof(uint32) + stream.total_out);
+        return true;
+    }
+
     bool RewriteCompressedPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
     {
         size_t packetSize = packet.size();
@@ -639,9 +670,13 @@ namespace
         if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
             return false;
 
-        WorldPacket updated(SMSG_UPDATE_OBJECT, decompressed.size());
-        if (!decompressed.empty())
-            updated.append(decompressed.data(), decompressed.size());
+        std::vector<uint8> recompressed;
+        if (!Compress(decompressed, recompressed))
+            return false;
+
+        WorldPacket updated(SMSG_COMPRESSED_UPDATE_OBJECT, recompressed.size());
+        if (!recompressed.empty())
+            updated.append(recompressed.data(), recompressed.size());
 
         packet = std::move(updated);
         return true;

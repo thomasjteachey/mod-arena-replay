@@ -17,6 +17,7 @@
 #include "ScriptMgr.h"
 #include <iomanip>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -513,7 +514,7 @@ namespace
         return true;
     }
 
-    uint64 GenerateGhostGuid(uint64 originalGuid, MatchRecord const& record)
+    uint64 GenerateGhostGuid(uint64 originalGuid, std::unordered_set<uint64> const& usedGuids)
     {
         auto originalBytes = GetGuidBytes(originalGuid);
         std::vector<size_t> nonZeroIndices;
@@ -569,7 +570,7 @@ namespace
             if (candidate == 0 || candidate == originalGuid)
                 continue;
 
-            if (!ReplayMetadataContainsGuid(record, candidate))
+            if (usedGuids.find(candidate) == usedGuids.end())
                 return candidate;
         }
 
@@ -577,7 +578,7 @@ namespace
         do
         {
             ++candidate;
-        } while (candidate == 0 || ReplayMetadataContainsGuid(record, candidate));
+        } while (candidate == 0 || usedGuids.find(candidate) != usedGuids.end());
 
         return candidate;
     }
@@ -757,41 +758,64 @@ namespace
         return RewriteRawPacket(packet, fromGuid, toGuid);
     }
 
-    void RemapReplayGuidForViewer(MatchRecord& record, uint64 viewerGuid)
+    std::unordered_set<uint64> BuildUsedGuidSet(MatchRecord const& record)
     {
-        if (viewerGuid == 0)
+        std::unordered_set<uint64> used;
+        used.insert(record.participantGuids.begin(), record.participantGuids.end());
+        for (PacketRecord const& packet : record.packets)
+            used.insert(packet.sourceGuid);
+
+        return used;
+    }
+
+    void RemapReplayGuids(MatchRecord& record)
+    {
+        if (record.participantGuids.empty())
             return;
 
-        uint64 ghostGuid = GenerateGhostGuid(viewerGuid, record);
-        if (ghostGuid == viewerGuid)
-            return;
+        std::unordered_set<uint64> usedGuids = BuildUsedGuidSet(record);
+        std::unordered_map<uint64, uint64> remap;
+        remap.reserve(record.participantGuids.size());
+
+        for (uint64 guid : record.participantGuids)
+        {
+            if (guid == 0)
+                continue;
+
+            if (remap.find(guid) != remap.end())
+                continue;
+
+            uint64 ghostGuid = GenerateGhostGuid(guid, usedGuids);
+            usedGuids.insert(ghostGuid);
+            remap.emplace(guid, ghostGuid);
+        }
 
         for (uint64& guid : record.participantGuids)
         {
-            if (guid == viewerGuid)
-                guid = ghostGuid;
+            auto it = remap.find(guid);
+            if (it != remap.end())
+                guid = it->second;
         }
 
         for (auto packetIt = record.packets.begin(); packetIt != record.packets.end();)
         {
             PacketRecord& packet = *packetIt;
-            if (packet.sourceGuid == viewerGuid)
-                packet.sourceGuid = ghostGuid;
+            auto sourceIt = remap.find(packet.sourceGuid);
+            if (sourceIt != remap.end())
+                packet.sourceGuid = sourceIt->second;
 
-            if (ReplaceGuidInPacket(packet.packet, viewerGuid, ghostGuid))
+            bool stillContainsOriginal = false;
+            for (auto const& entry : remap)
             {
-                ++packetIt;
-                continue;
+                ReplaceGuidInPacket(packet.packet, entry.first, entry.second);
+                if (PacketContainsGuid(packet.packet, entry.first))
+                    stillContainsOriginal = true;
             }
 
-            if (!PacketContainsGuid(packet.packet, viewerGuid))
-            {
+            if (stillContainsOriginal)
+                packetIt = record.packets.erase(packetIt);
+            else
                 ++packetIt;
-                continue;
-            }
-
-            LOG_WARN("modules", "ArenaReplay: dropping packet {} for viewer {} because GUID remap failed", packet.packet.GetOpcode(), viewerGuid);
-            packetIt = record.packets.erase(packetIt);
         }
     }
 }
@@ -1831,11 +1855,6 @@ private:
             return false;
         }
 
-        // Update 'timesWatched' of a Replay +1 everytime someone watches it
-        uint32 timesWatched = fields[6].Get<uint32>();
-        timesWatched++;
-        CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
-
         MatchRecord record;
         if (!fields[7].IsNull())
             AppendPlayerGuidsFromList(record.participantGuids, fields[7].Get<std::string>());
@@ -1845,7 +1864,12 @@ private:
 
         deserializeMatchData(record, fields);
 
-        RemapReplayGuidForViewer(record, p->GetGUID().GetRawValue());
+        // Update 'timesWatched' of a Replay +1 everytime someone watches it
+        uint32 timesWatched = fields[6].Get<uint32>();
+        timesWatched++;
+        CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
+
+        RemapReplayGuids(record);
 
         loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
         return true;

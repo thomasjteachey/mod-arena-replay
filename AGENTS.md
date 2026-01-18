@@ -5,7 +5,7 @@ Arena replays must allow a player to watch **their own match** without replay pa
 
 ## Key design points
 - **All participant GUIDs are remapped** to ghost GUIDs, not just the viewer. This avoids any original GUIDs appearing in replay packets.
-- **Replay packets are rewritten** to replace original GUIDs with ghost GUIDs. Any packet that still contains an original GUID after rewriting is **dropped**, preventing accidental delivery to a live player object.
+- **Replay packets are rewritten** to replace original GUIDs with ghost GUIDs. Packets are kept after rewriting to avoid false-positive GUID matches causing dropped data.
 - This design is critical to avoid crashes or undefined behavior when a player watches their own replay, because the client must never see packets targeting their real GUID.
 
 ## Where to look in code

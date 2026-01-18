@@ -797,25 +797,14 @@ namespace
                 guid = it->second;
         }
 
-        for (auto packetIt = record.packets.begin(); packetIt != record.packets.end();)
+        for (PacketRecord& packet : record.packets)
         {
-            PacketRecord& packet = *packetIt;
             auto sourceIt = remap.find(packet.sourceGuid);
             if (sourceIt != remap.end())
                 packet.sourceGuid = sourceIt->second;
 
-            bool stillContainsOriginal = false;
             for (auto const& entry : remap)
-            {
                 ReplaceGuidInPacket(packet.packet, entry.first, entry.second);
-                if (PacketContainsGuid(packet.packet, entry.first))
-                    stillContainsOriginal = true;
-            }
-
-            if (stillContainsOriginal)
-                packetIt = record.packets.erase(packetIt);
-            else
-                ++packetIt;
         }
     }
 }

@@ -35,26 +35,11 @@ std::vector<Opcodes> watchList =
         SMSG_AURA_UPDATE_ALL,
         SMSG_NAME_QUERY_RESPONSE,
         SMSG_DESTROY_OBJECT,
-        MSG_MOVE_START_FORWARD,
-        MSG_MOVE_SET_FACING,
-        MSG_MOVE_HEARTBEAT,
-        MSG_MOVE_JUMP,
         SMSG_MONSTER_MOVE,
-        MSG_MOVE_FALL_LAND,
         SMSG_PERIODICAURALOG,
         SMSG_ARENA_UNIT_DESTROYED,
-        MSG_MOVE_START_STRAFE_RIGHT,
-        MSG_MOVE_STOP_STRAFE,
-        MSG_MOVE_START_STRAFE_LEFT,
-        MSG_MOVE_STOP,
-        MSG_MOVE_START_BACKWARD,
-        MSG_MOVE_START_TURN_LEFT,
-        MSG_MOVE_STOP_TURN,
-        MSG_MOVE_START_TURN_RIGHT,
         SMSG_SPELL_START,
         SMSG_SPELL_GO,
-        CMSG_CAST_SPELL,
-        CMSG_CANCEL_CAST,
         SMSG_CAST_FAILED,
         SMSG_SPELL_START,
         SMSG_SPELL_FAILURE,
@@ -82,10 +67,8 @@ std::vector<Opcodes> watchList =
         SMSG_DISMOUNTRESULT,
         SMSG_MOUNTRESULT,
         SMSG_DISMOUNT,
-        CMSG_MOUNTSPECIAL_ANIM,
         SMSG_MOUNTSPECIAL_ANIM,
         SMSG_MIRRORIMAGE_DATA,
-        CMSG_MESSAGECHAT,
         SMSG_MESSAGECHAT
 };
 
@@ -103,11 +86,18 @@ struct MatchRecord {
     BattlegroundTypeId typeId;
     uint8 arenaTypeId;
     uint32 mapId;
+    uint32 replayId = 0;
     std::deque<PacketRecord> packets;
     std::vector<uint64> participantGuids;
     std::unordered_map<uint64, uint64> guidRemap;
     bool debugLoggedStart = false;
     size_t debugPacketsLogged = 0;
+    size_t sentPackets = 0;
+    bool maxPacketsLogged = false;
+    bool invalidOpcodeLogged = false;
+    bool invalidSendOpcodeLogged = false;
+    bool updateObjectParseWarningLogged = false;
+    size_t updateObjectParseLogs = 0;
 };
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
 std::unordered_map<uint32, MatchRecord> records;
@@ -184,6 +174,291 @@ namespace
         return packed.front();
     }
 
+    bool IsClientOpcode(Opcodes opcode)
+    {
+        switch (opcode)
+        {
+            case CMSG_CAST_SPELL:
+            case CMSG_CANCEL_CAST:
+            case CMSG_MOUNTSPECIAL_ANIM:
+            case CMSG_MESSAGECHAT:
+            case MSG_MOVE_START_FORWARD:
+            case MSG_MOVE_SET_FACING:
+            case MSG_MOVE_HEARTBEAT:
+            case MSG_MOVE_JUMP:
+            case MSG_MOVE_FALL_LAND:
+            case MSG_MOVE_START_STRAFE_RIGHT:
+            case MSG_MOVE_STOP_STRAFE:
+            case MSG_MOVE_START_STRAFE_LEFT:
+            case MSG_MOVE_STOP:
+            case MSG_MOVE_START_BACKWARD:
+            case MSG_MOVE_START_TURN_LEFT:
+            case MSG_MOVE_STOP_TURN:
+            case MSG_MOVE_START_TURN_RIGHT:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    enum class UpdateType : uint8
+    {
+        Values = 0,
+        Movement = 1,
+        CreateObject = 2,
+        CreateObject2 = 3,
+        OutOfRange = 4
+    };
+
+    constexpr uint32 MOVEFLAG_ONTRANSPORT = 0x00000200;
+    constexpr uint32 MOVEFLAG_SWIMMING = 0x00004000;
+    constexpr uint32 MOVEFLAG_FLYING = 0x00020000;
+    constexpr uint32 MOVEFLAG_FALLING = 0x00001000;
+    constexpr uint32 MOVEFLAG_SPLINE_ELEVATION = 0x00040000;
+    constexpr uint16 MOVEFLAG2_INTERPOLATED_MOVE = 0x0001;
+
+    struct UpdateObjectParseStats
+    {
+        uint32 blockCount = 0;
+        uint32 parsedBlocks = 0;
+        size_t bytesConsumed = 0;
+    };
+
+    bool CopyBytes(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output, size_t count)
+    {
+        if (offset + count > input.size())
+            return false;
+
+        output.insert(output.end(), input.begin() + offset, input.begin() + offset + count);
+        offset += count;
+        return true;
+    }
+
+    template <typename T>
+    bool ReadAndWrite(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output, T& value)
+    {
+        if (!ReadLittleEndian(input, offset, value))
+            return false;
+
+        WriteLittleEndian(output, value);
+        return true;
+    }
+
+    bool ReadPackedGuid(std::vector<uint8> const& input, size_t& offset, uint64& guid, std::vector<uint8>* packedBytes)
+    {
+        if (offset >= input.size())
+            return false;
+
+        uint8 mask = input[offset++];
+        guid = 0;
+
+        std::vector<uint8> packed;
+        packed.reserve(9);
+        packed.push_back(mask);
+
+        for (uint8 i = 0; i < 8; ++i)
+        {
+            if ((mask & (1u << i)) == 0)
+                continue;
+
+            if (offset >= input.size())
+                return false;
+
+            uint8 value = input[offset++];
+            packed.push_back(value);
+            guid |= (uint64(value) << (i * 8));
+        }
+
+        if (packedBytes)
+            *packedBytes = std::move(packed);
+
+        return true;
+    }
+
+    void WritePackedGuid(std::vector<uint8>& output, uint64 guid)
+    {
+        std::vector<uint8> packed = GetPackedGuidBytes(guid);
+        if (packed.empty())
+        {
+            output.push_back(0);
+            return;
+        }
+
+        output.insert(output.end(), packed.begin(), packed.end());
+    }
+
+    bool CopyMovementBlock(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output)
+    {
+        uint32 flags = 0;
+        uint16 flags2 = 0;
+        uint32 time = 0;
+
+        if (!ReadAndWrite(input, offset, output, flags))
+            return false;
+        if (!ReadAndWrite(input, offset, output, flags2))
+            return false;
+        if (!ReadAndWrite(input, offset, output, time))
+            return false;
+
+        if (!CopyBytes(input, offset, output, sizeof(float) * 4))
+            return false;
+
+        if (flags & MOVEFLAG_ONTRANSPORT)
+        {
+            uint64 transportGuid = 0;
+            if (!ReadAndWrite(input, offset, output, transportGuid))
+                return false;
+
+            if (!CopyBytes(input, offset, output, sizeof(float) * 4))
+                return false;
+
+            uint32 transportTime = 0;
+            if (!ReadAndWrite(input, offset, output, transportTime))
+                return false;
+
+            uint8 transportSeat = 0;
+            if (!ReadAndWrite(input, offset, output, transportSeat))
+                return false;
+
+            if (flags2 & MOVEFLAG2_INTERPOLATED_MOVE)
+            {
+                uint32 transportTime2 = 0;
+                if (!ReadAndWrite(input, offset, output, transportTime2))
+                    return false;
+            }
+        }
+
+        if (flags & (MOVEFLAG_SWIMMING | MOVEFLAG_FLYING))
+        {
+            if (!CopyBytes(input, offset, output, sizeof(float)))
+                return false;
+        }
+
+        uint32 fallTime = 0;
+        if (!ReadAndWrite(input, offset, output, fallTime))
+            return false;
+
+        if (flags & MOVEFLAG_FALLING)
+        {
+            if (!CopyBytes(input, offset, output, sizeof(float) * 4))
+                return false;
+        }
+
+        if (flags & MOVEFLAG_SPLINE_ELEVATION)
+        {
+            if (!CopyBytes(input, offset, output, sizeof(float)))
+                return false;
+        }
+
+        return true;
+    }
+
+    bool CopyUpdateMaskAndValues(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output)
+    {
+        uint8 maskCount = 0;
+        if (!ReadAndWrite(input, offset, output, maskCount))
+            return false;
+
+        uint32 bitCount = 0;
+        for (uint8 i = 0; i < maskCount; ++i)
+        {
+            uint32 mask = 0;
+            if (!ReadAndWrite(input, offset, output, mask))
+                return false;
+
+            bitCount += static_cast<uint32>(__builtin_popcount(mask));
+        }
+
+        size_t valueBytes = static_cast<size_t>(bitCount) * sizeof(uint32);
+        return CopyBytes(input, offset, output, valueBytes);
+    }
+
+    bool SkipMovementBlock(std::vector<uint8> const& input, size_t& offset)
+    {
+        uint32 flags = 0;
+        uint16 flags2 = 0;
+        uint32 time = 0;
+
+        if (!ReadLittleEndian(input, offset, flags))
+            return false;
+        if (!ReadLittleEndian(input, offset, flags2))
+            return false;
+        if (!ReadLittleEndian(input, offset, time))
+            return false;
+
+        if (!SkipBytes(input, offset, sizeof(float) * 4))
+            return false;
+
+        if (flags & MOVEFLAG_ONTRANSPORT)
+        {
+            uint64 transportGuid = 0;
+            if (!ReadLittleEndian(input, offset, transportGuid))
+                return false;
+
+            if (!SkipBytes(input, offset, sizeof(float) * 4))
+                return false;
+
+            uint32 transportTime = 0;
+            if (!ReadLittleEndian(input, offset, transportTime))
+                return false;
+
+            uint8 transportSeat = 0;
+            if (!ReadLittleEndian(input, offset, transportSeat))
+                return false;
+
+            if (flags2 & MOVEFLAG2_INTERPOLATED_MOVE)
+            {
+                uint32 transportTime2 = 0;
+                if (!ReadLittleEndian(input, offset, transportTime2))
+                    return false;
+            }
+        }
+
+        if (flags & (MOVEFLAG_SWIMMING | MOVEFLAG_FLYING))
+        {
+            if (!SkipBytes(input, offset, sizeof(float)))
+                return false;
+        }
+
+        uint32 fallTime = 0;
+        if (!ReadLittleEndian(input, offset, fallTime))
+            return false;
+
+        if (flags & MOVEFLAG_FALLING)
+        {
+            if (!SkipBytes(input, offset, sizeof(float) * 4))
+                return false;
+        }
+
+        if (flags & MOVEFLAG_SPLINE_ELEVATION)
+        {
+            if (!SkipBytes(input, offset, sizeof(float)))
+                return false;
+        }
+
+        return true;
+    }
+
+    bool SkipUpdateMaskAndValues(std::vector<uint8> const& input, size_t& offset)
+    {
+        uint8 maskCount = 0;
+        if (!ReadLittleEndian(input, offset, maskCount))
+            return false;
+
+        uint32 bitCount = 0;
+        for (uint8 i = 0; i < maskCount; ++i)
+        {
+            uint32 mask = 0;
+            if (!ReadLittleEndian(input, offset, mask))
+                return false;
+
+            bitCount += static_cast<uint32>(__builtin_popcount(mask));
+        }
+
+        size_t valueBytes = static_cast<size_t>(bitCount) * sizeof(uint32);
+        return SkipBytes(input, offset, valueBytes);
+    }
+
     bool ContainsSequence(std::vector<uint8> const& buffer, std::vector<uint8> const& sequence)
     {
         if (sequence.empty() || buffer.size() < sequence.size())
@@ -214,6 +489,369 @@ namespace
         }
 
         return modified;
+    }
+
+    bool SkipBytes(std::vector<uint8> const& input, size_t& offset, size_t count)
+    {
+        if (offset + count > input.size())
+            return false;
+
+        offset += count;
+        return true;
+    }
+
+    bool ProcessUpdateObjectPayload(std::vector<uint8> const& input, std::vector<uint8>* output,
+        std::unordered_map<uint64, uint64> const* remap, std::unordered_set<uint64>* extracted,
+        UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        size_t offset = 0;
+        auto writeByte = [&](uint8 value)
+        {
+            if (output)
+                output->push_back(value);
+        };
+
+        uint32 blockCount = 0;
+        if (!ReadLittleEndian(input, offset, blockCount))
+        {
+            failureOffset = offset;
+            return false;
+        }
+
+        stats.blockCount = blockCount;
+        if (output)
+            WriteLittleEndian(*output, blockCount);
+
+        uint8 transportFlag = 0;
+        if (!ReadLittleEndian(input, offset, transportFlag))
+        {
+            failureOffset = offset;
+            return false;
+        }
+        writeByte(transportFlag);
+
+        for (uint32 blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+        {
+            uint8 updateTypeValue = 0;
+            if (!ReadLittleEndian(input, offset, updateTypeValue))
+            {
+                failureOffset = offset;
+                return false;
+            }
+            writeByte(updateTypeValue);
+
+            UpdateType updateType = static_cast<UpdateType>(updateTypeValue);
+            if (updateType == UpdateType::OutOfRange)
+            {
+                uint32 guidCount = 0;
+                if (output)
+                {
+                    if (!ReadAndWrite(input, offset, *output, guidCount))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!ReadLittleEndian(input, offset, guidCount))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+
+                for (uint32 i = 0; i < guidCount; ++i)
+                {
+                    uint64 guid = 0;
+                    std::vector<uint8> packed;
+                    if (!ReadPackedGuid(input, offset, guid, output ? &packed : nullptr))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+
+                    if (extracted && guid != 0)
+                        extracted->insert(guid);
+
+                    uint64 finalGuid = guid;
+                    if (remap)
+                    {
+                        auto it = remap->find(guid);
+                        if (it != remap->end())
+                            finalGuid = it->second;
+                    }
+
+                    if (output)
+                    {
+                        if (finalGuid != guid)
+                            WritePackedGuid(*output, finalGuid);
+                        else if (!packed.empty())
+                            output->insert(output->end(), packed.begin(), packed.end());
+                        else
+                            output->push_back(0);
+                    }
+                }
+
+                ++stats.parsedBlocks;
+                continue;
+            }
+
+            uint64 objectGuid = 0;
+            std::vector<uint8> packedGuid;
+            if (!ReadPackedGuid(input, offset, objectGuid, output ? &packedGuid : nullptr))
+            {
+                failureOffset = offset;
+                return false;
+            }
+
+            if (extracted && objectGuid != 0)
+                extracted->insert(objectGuid);
+
+            uint64 finalGuid = objectGuid;
+            if (remap)
+            {
+                auto it = remap->find(objectGuid);
+                if (it != remap->end())
+                    finalGuid = it->second;
+            }
+
+            if (output)
+            {
+                if (finalGuid != objectGuid)
+                    WritePackedGuid(*output, finalGuid);
+                else if (!packedGuid.empty())
+                    output->insert(output->end(), packedGuid.begin(), packedGuid.end());
+                else
+                    output->push_back(0);
+            }
+
+            if (updateType == UpdateType::CreateObject || updateType == UpdateType::CreateObject2)
+            {
+                uint8 objectTypeId = 0;
+                if (output)
+                {
+                    if (!ReadAndWrite(input, offset, *output, objectTypeId))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!ReadLittleEndian(input, offset, objectTypeId))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+
+                if (output)
+                {
+                    if (!CopyMovementBlock(input, offset, *output))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!SkipMovementBlock(input, offset))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+
+                if (output)
+                {
+                    if (!CopyUpdateMaskAndValues(input, offset, *output))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!SkipUpdateMaskAndValues(input, offset))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+            }
+            else if (updateType == UpdateType::Values)
+            {
+                if (output)
+                {
+                    if (!CopyUpdateMaskAndValues(input, offset, *output))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!SkipUpdateMaskAndValues(input, offset))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+            }
+            else if (updateType == UpdateType::Movement)
+            {
+                if (output)
+                {
+                    if (!CopyMovementBlock(input, offset, *output))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!SkipMovementBlock(input, offset))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                failureOffset = offset;
+                return false;
+            }
+
+            ++stats.parsedBlocks;
+        }
+
+        stats.bytesConsumed = offset;
+        if (offset != input.size())
+        {
+            failureOffset = offset;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool RewriteUpdateObjectPacket(WorldPacket& packet, std::unordered_map<uint64, uint64> const& remap,
+        UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> input(contents, contents + packetSize);
+        std::vector<uint8> output;
+        output.reserve(input.size());
+
+        if (!ProcessUpdateObjectPayload(input, &output, &remap, nullptr, stats, failureOffset))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), output.size());
+        if (!output.empty())
+            updated.append(output.data(), output.size());
+
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool RewriteCompressedUpdateObjectPacket(WorldPacket& packet, std::unordered_map<uint64, uint64> const& remap,
+        UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> input(contents, contents + packetSize);
+        std::vector<uint8> decompressed;
+
+        if (!Decompress(input, decompressed))
+            return false;
+
+        std::vector<uint8> rewritten;
+        rewritten.reserve(decompressed.size());
+        if (!ProcessUpdateObjectPayload(decompressed, &rewritten, &remap, nullptr, stats, failureOffset))
+            return false;
+
+        std::vector<uint8> recompressed;
+        if (!Compress(rewritten, recompressed))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), recompressed.size());
+        if (!recompressed.empty())
+            updated.append(recompressed.data(), recompressed.size());
+
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool ExtractGuidsFromUpdateObjectPayload(std::vector<uint8> const& input, std::unordered_set<uint64>& guids,
+        UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        return ProcessUpdateObjectPayload(input, nullptr, nullptr, &guids, stats, failureOffset);
+    }
+
+    bool ExtractGuidsFromPacket(WorldPacket const& packet, std::unordered_set<uint64>& guids, UpdateObjectParseStats& stats,
+        size_t& failureOffset)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return true;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return true;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+        {
+            std::vector<uint8> decompressed;
+            if (!Decompress(buffer, decompressed))
+                return false;
+
+            return ExtractGuidsFromUpdateObjectPayload(decompressed, guids, stats, failureOffset);
+        }
+
+        if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
+            return ExtractGuidsFromUpdateObjectPayload(buffer, guids, stats, failureOffset);
+
+        if (packet.GetOpcode() == SMSG_DESTROY_OBJECT)
+        {
+            size_t offset = 0;
+            uint64 guid = 0;
+            std::vector<uint8> packed;
+            if (ReadPackedGuid(buffer, offset, guid, &packed))
+            {
+                if (guid != 0)
+                    guids.insert(guid);
+                return true;
+            }
+
+            offset = 0;
+            if (offset + sizeof(uint64) <= buffer.size())
+            {
+                std::array<uint8, 8> bytes{};
+                for (size_t i = 0; i < bytes.size(); ++i)
+                    bytes[i] = buffer[offset + i];
+                guid = BuildGuidFromBytes(bytes);
+                if (guid != 0)
+                    guids.insert(guid);
+            }
+        }
+
+        return true;
     }
 
     template <typename T>
@@ -526,6 +1164,14 @@ namespace
         return true;
     }
 
+    uint64 SplitMix64(uint64 value)
+    {
+        value += 0x9E3779B97F4A7C15ULL;
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+        return value ^ (value >> 31);
+    }
+
     uint64 GenerateGhostGuid(uint64 originalGuid, std::unordered_set<uint64> const& usedGuids)
     {
         auto originalBytes = GetGuidBytes(originalGuid);
@@ -541,53 +1187,32 @@ namespace
         if (nonZeroIndices.empty())
             return originalGuid;
 
-        auto BuildCandidate = [&](std::vector<uint16> const& offsets)
+        auto BuildCandidate = [&](uint64 hash)
         {
             std::array<uint8, 8> candidateBytes = originalBytes;
             for (size_t i = 0; i < nonZeroIndices.size(); ++i)
             {
                 size_t byteIndex = nonZeroIndices[i];
-                uint16 base = originalBytes[byteIndex];
-                uint16 offset = offsets[i];
-                uint16 value = static_cast<uint16>(((base - 1u + offset) % 255u) + 1u);
-                candidateBytes[byteIndex] = static_cast<uint8>(value);
+                uint8 value = static_cast<uint8>(0xC0u + ((hash >> (i * 8)) % 0x3Fu));
+                if (value == 0)
+                    value = 1;
+                candidateBytes[byteIndex] = value;
             }
 
             return BuildGuidFromBytes(candidateBytes);
         };
 
-        std::vector<uint16> offsets(nonZeroIndices.size(), 0);
-        while (true)
+        uint64 hash = SplitMix64(originalGuid);
+        for (uint32 attempt = 0; attempt < 10000; ++attempt)
         {
-            size_t position = 0;
-            while (position < offsets.size())
+            uint64 candidate = BuildCandidate(hash);
+            if (candidate != 0 && candidate != originalGuid && GetPackedMask(candidate) == originalMask
+                && usedGuids.find(candidate) == usedGuids.end())
             {
-                if (offsets[position] < 254)
-                {
-                    ++offsets[position];
-                    break;
-                }
-
-                offsets[position] = 0;
-                ++position;
+                return candidate;
             }
 
-            if (position == offsets.size())
-                break;
-
-            bool allZero = std::all_of(offsets.begin(), offsets.end(), [](uint16 value) { return value == 0; });
-            if (allZero)
-                continue;
-
-            uint64 candidate = BuildCandidate(offsets);
-            if (candidate == 0 || candidate == originalGuid)
-                continue;
-
-            if (GetPackedMask(candidate) != originalMask)
-                continue;
-
-            if (usedGuids.find(candidate) == usedGuids.end())
-                return candidate;
+            hash = SplitMix64(hash + attempt + 1);
         }
 
         uint64 candidate = originalGuid;
@@ -787,18 +1412,43 @@ namespace
                 return true;
         }
 
-        if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
-            return RewriteCompressedPacket(packet, fromGuid, toGuid);
+        if (packet.GetOpcode() == SMSG_UPDATE_OBJECT || packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+        {
+            std::unordered_map<uint64, uint64> remap{ { fromGuid, toGuid } };
+            UpdateObjectParseStats stats;
+            size_t failureOffset = 0;
+            if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
+                return RewriteUpdateObjectPacket(packet, remap, stats, failureOffset);
+            return RewriteCompressedUpdateObjectPacket(packet, remap, stats, failureOffset);
+        }
 
         return RewriteRawPacket(packet, fromGuid, toGuid);
     }
 
-    std::unordered_set<uint64> BuildUsedGuidSet(MatchRecord const& record)
+    std::unordered_set<uint64> BuildUsedGuidSet(MatchRecord& record)
     {
         std::unordered_set<uint64> used;
         used.insert(record.participantGuids.begin(), record.participantGuids.end());
         for (PacketRecord const& packet : record.packets)
             used.insert(packet.sourceGuid);
+
+        for (PacketRecord const& packet : record.packets)
+        {
+            UpdateObjectParseStats stats;
+            size_t failureOffset = 0;
+            if (!ExtractGuidsFromPacket(packet.packet, used, stats, failureOffset))
+            {
+                if (!record.updateObjectParseWarningLogged)
+                {
+                    LOG_WARN("modules", "ArenaReplay: failed to parse update object payload while extracting GUIDs for replay {} opcode {} packetSize {} offset {}",
+                        record.replayId,
+                        packet.packet.GetOpcode(),
+                        packet.packet.size(),
+                        failureOffset);
+                    record.updateObjectParseWarningLogged = true;
+                }
+            }
+        }
 
         return used;
     }
@@ -843,6 +1493,41 @@ namespace
             auto sourceIt = record.guidRemap.find(packet.sourceGuid);
             if (sourceIt != record.guidRemap.end())
                 packet.sourceGuid = sourceIt->second;
+
+            if (packet.packet.GetOpcode() == SMSG_UPDATE_OBJECT || packet.packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+            {
+                UpdateObjectParseStats stats;
+                size_t failureOffset = 0;
+                bool rewritten = false;
+                if (packet.packet.GetOpcode() == SMSG_UPDATE_OBJECT)
+                    rewritten = RewriteUpdateObjectPacket(packet.packet, record.guidRemap, stats, failureOffset);
+                else
+                    rewritten = RewriteCompressedUpdateObjectPacket(packet.packet, record.guidRemap, stats, failureOffset);
+
+                if (rewritten)
+                {
+                    if (record.updateObjectParseLogs < 5)
+                    {
+                        LOG_INFO("modules", "ArenaReplay: parsed update object opcode {} blocks {}/{} bytes {}",
+                            packet.packet.GetOpcode(),
+                            stats.parsedBlocks,
+                            stats.blockCount,
+                            stats.bytesConsumed);
+                        ++record.updateObjectParseLogs;
+                    }
+                }
+                else if (!record.updateObjectParseWarningLogged)
+                {
+                    LOG_WARN("modules", "ArenaReplay: failed to parse update object payload for replay {} opcode {} packetSize {} offset {}",
+                        record.replayId,
+                        packet.packet.GetOpcode(),
+                        packet.packet.size(),
+                        failureOffset);
+                    record.updateObjectParseWarningLogged = true;
+                }
+
+                continue;
+            }
 
             for (auto const& entry : record.guidRemap)
                 ReplaceGuidInPacket(packet.packet, entry.first, entry.second);
@@ -891,13 +1576,25 @@ public:
             }
         }
 
-        // ignore packets not in watch list
-        if (std::find(watchList.begin(), watchList.end(), packet.GetOpcode()) == watchList.end())
-            return true;
-
         if (records.find(bg->GetInstanceID()) == records.end())
             records[bg->GetInstanceID()].packets.clear();
         MatchRecord& record = records[bg->GetInstanceID()];
+
+        if (IsClientOpcode(packet.GetOpcode()))
+        {
+            if (!record.invalidOpcodeLogged)
+            {
+                LOG_ERROR("modules", "ArenaReplay: unexpected client opcode {} observed during SERVERHOOK_CAN_PACKET_SEND for bg instance {}",
+                    packet.GetOpcode(),
+                    bg->GetInstanceID());
+                record.invalidOpcodeLogged = true;
+            }
+            return true;
+        }
+
+        // ignore packets not in watch list
+        if (std::find(watchList.begin(), watchList.end(), packet.GetOpcode()) == watchList.end())
+            return true;
 
         uint32 timestamp = bg->GetStartTime();
         record.typeId = bg->GetBgTypeID();
@@ -993,10 +1690,25 @@ public:
         bool observerIsParticipant = false;
         uint64 observerGhostGuid = observerRealGuid;
         auto remapIt = match.guidRemap.find(observerRealGuid);
-        if (remapIt != match.guidRemap.end())
+        if (observerRealGuid != 0 && remapIt != match.guidRemap.end())
         {
             observerGhostGuid = remapIt->second;
             observerIsParticipant = true;
+        }
+
+        uint32 maxPacketsToSend = sConfigMgr->GetOption<uint32>("ArenaReplay.MaxPacketsToSend", 0);
+        if (maxPacketsToSend > 0 && match.sentPackets >= maxPacketsToSend)
+        {
+            if (!match.maxPacketsLogged)
+            {
+                LOG_INFO("modules", "ArenaReplay: reached MaxPacketsToSend {} for replay {} last opcode {} ts {}",
+                    maxPacketsToSend,
+                    match.replayId,
+                    match.packets.front().packet.GetOpcode(),
+                    match.packets.front().timestamp);
+                match.maxPacketsLogged = true;
+            }
+            return;
         }
 
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
@@ -1022,6 +1734,33 @@ public:
                 continue;
             }
 
+            if (IsClientOpcode(static_cast<Opcodes>(packetRecord.packet.GetOpcode())))
+            {
+                if (!match.invalidSendOpcodeLogged)
+                {
+                    LOG_ERROR("modules", "ArenaReplay: skipping client opcode {} during replay {}",
+                        packetRecord.packet.GetOpcode(),
+                        match.replayId);
+                    match.invalidSendOpcodeLogged = true;
+                }
+                match.packets.pop_front();
+                continue;
+            }
+
+            if (maxPacketsToSend > 0 && match.sentPackets >= maxPacketsToSend)
+            {
+                if (!match.maxPacketsLogged)
+                {
+                    LOG_INFO("modules", "ArenaReplay: reached MaxPacketsToSend {} for replay {} last opcode {} ts {}",
+                        maxPacketsToSend,
+                        match.replayId,
+                        packetRecord.packet.GetOpcode(),
+                        packetRecord.timestamp);
+                    match.maxPacketsLogged = true;
+                }
+                return;
+            }
+
             WorldPacket const* myPacket = &packetRecord.packet;
             Player* replayer = bg->GetPlayers().begin()->second;
             if (match.debugPacketsLogged < 50)
@@ -1035,6 +1774,7 @@ public:
                 ++match.debugPacketsLogged;
             }
             replayer->GetSession()->SendPacket(myPacket);
+            ++match.sentPackets;
             match.packets.pop_front();
         }
     }
@@ -1927,6 +2667,7 @@ private:
         }
 
         MatchRecord record;
+        record.replayId = matchId;
         if (!fields[7].IsNull())
             AppendPlayerGuidsFromList(record.participantGuids, fields[7].Get<std::string>());
 

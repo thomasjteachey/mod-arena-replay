@@ -210,12 +210,60 @@ namespace
         OutOfRange = 4
     };
 
+    enum class TypeId : uint8
+    {
+        Object = 0,
+        Item = 1,
+        Container = 2,
+        Unit = 3,
+        Player = 4,
+        GameObject = 5,
+        DynamicObject = 6,
+        Corpse = 7
+    };
+
+    // Field indices based on TrinityCore 3.3.5 UpdateFields.h; 0xFFFF denotes unavailable fields in this fork.
+    constexpr uint16 UNIT_FIELD_CHARM = 0x0006;
+    constexpr uint16 UNIT_FIELD_SUMMON = 0x0008;
+    constexpr uint16 UNIT_FIELD_CHARMEDBY = 0x000A;
+    constexpr uint16 UNIT_FIELD_SUMMONEDBY = 0x000C;
+    constexpr uint16 UNIT_FIELD_CREATEDBY = 0x000E;
+    constexpr uint16 UNIT_FIELD_TARGET = 0x0010;
+    constexpr uint16 UNIT_FIELD_CHANNEL_OBJECT = 0x0012;
+    constexpr uint16 UNIT_FIELD_PERSUADED = 0xFFFF;
+    constexpr std::array<uint16, 8> UNIT_GUID_FIELDS_LOW = {
+        UNIT_FIELD_TARGET,
+        UNIT_FIELD_CHANNEL_OBJECT,
+        UNIT_FIELD_SUMMON,
+        UNIT_FIELD_CHARM,
+        UNIT_FIELD_CHARMEDBY,
+        UNIT_FIELD_SUMMONEDBY,
+        UNIT_FIELD_CREATEDBY,
+        UNIT_FIELD_PERSUADED
+    };
+
+    constexpr uint16 PLAYER_FARSIGHT = 0xFFFF;
+    constexpr std::array<uint16, 1> PLAYER_GUID_FIELDS_LOW = {
+        PLAYER_FARSIGHT
+    };
+
     constexpr uint32 MOVEFLAG_ONTRANSPORT = 0x00000200;
     constexpr uint32 MOVEFLAG_SWIMMING = 0x00004000;
     constexpr uint32 MOVEFLAG_FLYING = 0x00020000;
     constexpr uint32 MOVEFLAG_FALLING = 0x00001000;
     constexpr uint32 MOVEFLAG_SPLINE_ELEVATION = 0x00040000;
     constexpr uint16 MOVEFLAG2_INTERPOLATED_MOVE = 0x0001;
+
+    bool IsGuidLowField(uint16 fieldIndex, uint8 objectTypeId)
+    {
+        if (objectTypeId == static_cast<uint8>(TypeId::Unit))
+            return std::find(UNIT_GUID_FIELDS_LOW.begin(), UNIT_GUID_FIELDS_LOW.end(), fieldIndex) != UNIT_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::Player))
+            return std::find(PLAYER_GUID_FIELDS_LOW.begin(), PLAYER_GUID_FIELDS_LOW.end(), fieldIndex) != PLAYER_GUID_FIELDS_LOW.end();
+
+        return false;
+    }
 
     struct UpdateObjectParseStats
     {
@@ -287,7 +335,8 @@ namespace
         output.insert(output.end(), packed.begin(), packed.end());
     }
 
-    bool CopyMovementBlock(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output)
+    bool CopyMovementBlock(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output,
+        std::unordered_map<uint64, uint64> const* remap, std::unordered_set<uint64>* extracted)
     {
         uint32 flags = 0;
         uint16 flags2 = 0;
@@ -306,8 +355,21 @@ namespace
         if (flags & MOVEFLAG_ONTRANSPORT)
         {
             uint64 transportGuid = 0;
-            if (!ReadAndWrite(input, offset, output, transportGuid))
+            if (!ReadLittleEndian(input, offset, transportGuid))
                 return false;
+
+            if (extracted && transportGuid != 0)
+                extracted->insert(transportGuid);
+
+            uint64 finalTransportGuid = transportGuid;
+            if (remap)
+            {
+                auto it = remap->find(transportGuid);
+                if (it != remap->end())
+                    finalTransportGuid = it->second;
+            }
+
+            WriteLittleEndian(output, finalTransportGuid);
 
             if (!CopyBytes(input, offset, output, sizeof(float) * 4))
                 return false;
@@ -353,24 +415,79 @@ namespace
         return true;
     }
 
-    bool CopyUpdateMaskAndValues(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output)
+    bool CopyUpdateMaskAndValues(std::vector<uint8> const& input, size_t& offset, std::vector<uint8>& output,
+        std::unordered_map<uint64, uint64> const* remap, uint8 objectTypeId, std::unordered_set<uint64>* extracted)
     {
         uint8 maskCount = 0;
         if (!ReadAndWrite(input, offset, output, maskCount))
             return false;
 
-        uint32 bitCount = 0;
+        std::vector<uint32> masks;
+        masks.reserve(maskCount);
         for (uint8 i = 0; i < maskCount; ++i)
         {
             uint32 mask = 0;
             if (!ReadAndWrite(input, offset, output, mask))
                 return false;
-
-            bitCount += static_cast<uint32>(__builtin_popcount(mask));
+            masks.push_back(mask);
         }
 
-        size_t valueBytes = static_cast<size_t>(bitCount) * sizeof(uint32);
-        return CopyBytes(input, offset, output, valueBytes);
+        std::vector<uint16> fields;
+        fields.reserve(static_cast<size_t>(maskCount) * 32);
+        for (uint8 maskIndex = 0; maskIndex < maskCount; ++maskIndex)
+        {
+            uint32 mask = masks[maskIndex];
+            for (uint8 bit = 0; bit < 32; ++bit)
+            {
+                if ((mask & (1u << bit)) == 0)
+                    continue;
+                fields.push_back(static_cast<uint16>(maskIndex * 32 + bit));
+            }
+        }
+
+        for (size_t i = 0; i < fields.size(); ++i)
+        {
+            uint16 fieldIndex = fields[i];
+            uint32 lowValue = 0;
+            if (!ReadLittleEndian(input, offset, lowValue))
+                return false;
+
+            bool hasHigh = (i + 1) < fields.size() && fields[i + 1] == static_cast<uint16>(fieldIndex + 1);
+            if (hasHigh)
+            {
+                uint32 highValue = 0;
+                if (!ReadLittleEndian(input, offset, highValue))
+                    return false;
+
+                uint64 guid = (uint64(highValue) << 32) | lowValue;
+                uint64 finalGuid = guid;
+                bool isGuidField = IsGuidLowField(fieldIndex, objectTypeId);
+                bool shouldRewrite = isGuidField;
+                if (!shouldRewrite && remap && guid != 0)
+                    shouldRewrite = remap->find(guid) != remap->end();
+
+                if (shouldRewrite && remap)
+                {
+                    auto it = remap->find(guid);
+                    if (it != remap->end())
+                        finalGuid = it->second;
+                }
+
+                if (extracted && guid != 0 && isGuidField)
+                    extracted->insert(guid);
+
+                uint32 finalLow = static_cast<uint32>(finalGuid & 0xFFFFFFFFu);
+                uint32 finalHigh = static_cast<uint32>((finalGuid >> 32) & 0xFFFFFFFFu);
+                WriteLittleEndian(output, finalLow);
+                WriteLittleEndian(output, finalHigh);
+                ++i;
+                continue;
+            }
+
+            WriteLittleEndian(output, lowValue);
+        }
+
+        return true;
     }
 
     bool SkipMovementBlock(std::vector<uint8> const& input, size_t& offset)
@@ -505,6 +622,8 @@ namespace
         UpdateObjectParseStats& stats, size_t& failureOffset)
     {
         size_t offset = 0;
+        std::vector<uint8> scratchOutput;
+        std::unordered_map<uint64, uint8> objectTypes;
         auto writeByte = [&](uint8 value)
         {
             if (output)
@@ -646,9 +765,11 @@ namespace
                     }
                 }
 
+                objectTypes[finalGuid] = objectTypeId;
+
                 if (output)
                 {
-                    if (!CopyMovementBlock(input, offset, *output))
+                    if (!CopyMovementBlock(input, offset, *output, remap, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -656,7 +777,7 @@ namespace
                 }
                 else
                 {
-                    if (!SkipMovementBlock(input, offset))
+                    if (!CopyMovementBlock(input, offset, scratchOutput, nullptr, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -665,7 +786,7 @@ namespace
 
                 if (output)
                 {
-                    if (!CopyUpdateMaskAndValues(input, offset, *output))
+                    if (!CopyUpdateMaskAndValues(input, offset, *output, remap, objectTypeId, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -673,7 +794,7 @@ namespace
                 }
                 else
                 {
-                    if (!SkipUpdateMaskAndValues(input, offset))
+                    if (!CopyUpdateMaskAndValues(input, offset, scratchOutput, nullptr, objectTypeId, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -682,9 +803,14 @@ namespace
             }
             else if (updateType == UpdateType::Values)
             {
+                uint8 objectTypeId = 0xFF;
+                auto typeIt = objectTypes.find(finalGuid);
+                if (typeIt != objectTypes.end())
+                    objectTypeId = typeIt->second;
+
                 if (output)
                 {
-                    if (!CopyUpdateMaskAndValues(input, offset, *output))
+                    if (!CopyUpdateMaskAndValues(input, offset, *output, remap, objectTypeId, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -692,7 +818,7 @@ namespace
                 }
                 else
                 {
-                    if (!SkipUpdateMaskAndValues(input, offset))
+                    if (!CopyUpdateMaskAndValues(input, offset, scratchOutput, nullptr, objectTypeId, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -703,7 +829,7 @@ namespace
             {
                 if (output)
                 {
-                    if (!CopyMovementBlock(input, offset, *output))
+                    if (!CopyMovementBlock(input, offset, *output, remap, extracted))
                     {
                         failureOffset = offset;
                         return false;
@@ -711,7 +837,7 @@ namespace
                 }
                 else
                 {
-                    if (!SkipMovementBlock(input, offset))
+                    if (!CopyMovementBlock(input, offset, scratchOutput, nullptr, extracted))
                     {
                         failureOffset = offset;
                         return false;

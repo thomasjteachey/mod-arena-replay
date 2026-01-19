@@ -174,6 +174,15 @@ namespace
         return packed;
     }
 
+    uint8 GetPackedMask(uint64 guid)
+    {
+        std::vector<uint8> packed = GetPackedGuidBytes(guid);
+        if (packed.empty())
+            return 0;
+
+        return packed.front();
+    }
+
     bool ContainsSequence(std::vector<uint8> const& buffer, std::vector<uint8> const& sequence)
     {
         if (sequence.empty() || buffer.size() < sequence.size())
@@ -519,6 +528,7 @@ namespace
     uint64 GenerateGhostGuid(uint64 originalGuid, std::unordered_set<uint64> const& usedGuids)
     {
         auto originalBytes = GetGuidBytes(originalGuid);
+        uint8 originalMask = GetPackedMask(originalGuid);
         std::vector<size_t> nonZeroIndices;
         nonZeroIndices.reserve(originalBytes.size());
         for (size_t i = 0; i < originalBytes.size(); ++i)
@@ -572,6 +582,9 @@ namespace
             if (candidate == 0 || candidate == originalGuid)
                 continue;
 
+            if (GetPackedMask(candidate) != originalMask)
+                continue;
+
             if (usedGuids.find(candidate) == usedGuids.end())
                 return candidate;
         }
@@ -580,7 +593,7 @@ namespace
         do
         {
             ++candidate;
-        } while (candidate == 0 || usedGuids.find(candidate) != usedGuids.end());
+        } while (candidate == 0 || usedGuids.find(candidate) != usedGuids.end() || GetPackedMask(candidate) != originalMask);
 
         return candidate;
     }
@@ -603,7 +616,7 @@ namespace
         return false;
     }
 
-    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
+    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid, bool allowRaw)
     {
         if (payload.empty())
             return false;
@@ -615,10 +628,25 @@ namespace
         std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
         std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
 
-        bool modified = ReplaceSequence(payload, fromBytes, toBytes);
+        bool modified = false;
+        if (allowRaw)
+            modified |= ReplaceSequence(payload, fromBytes, toBytes);
 
         if (!fromPacked.empty() && !toPacked.empty())
-            modified |= ReplaceSequence(payload, fromPacked, toPacked);
+        {
+            if (fromPacked.size() == toPacked.size() && fromPacked.front() == toPacked.front())
+            {
+                modified |= ReplaceSequence(payload, fromPacked, toPacked);
+            }
+            else
+            {
+                LOG_WARN("modules", "ArenaReplay: packed GUID shape mismatch (from mask {:02X} size {}, to mask {:02X} size {}), skipping packed replacement",
+                    fromPacked.front(),
+                    fromPacked.size(),
+                    toPacked.front(),
+                    toPacked.size());
+            }
+        }
 
         return modified;
     }
@@ -670,7 +698,7 @@ namespace
         if (!Decompress(buffer, decompressed))
             return false;
 
-        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
+        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid, false))
             return false;
 
         std::vector<uint8> recompressed;
@@ -696,7 +724,8 @@ namespace
             return false;
 
         std::vector<uint8> buffer(contents, contents + packetSize);
-        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid))
+        bool allowRaw = packet.GetOpcode() != SMSG_UPDATE_OBJECT;
+        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid, allowRaw))
             return false;
 
         WorldPacket updated(packet.GetOpcode(), buffer.size());

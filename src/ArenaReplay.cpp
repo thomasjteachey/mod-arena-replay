@@ -105,6 +105,8 @@ struct MatchRecord {
     uint32 mapId;
     std::deque<PacketRecord> packets;
     std::vector<uint64> participantGuids;
+    bool debugLoggedStart = false;
+    size_t debugPacketsLogged = 0;
 };
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
 std::unordered_map<uint32, MatchRecord> records;
@@ -797,6 +799,10 @@ namespace
                 guid = it->second;
         }
 
+        LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
+            remap.size(),
+            record.packets.size());
+
         for (PacketRecord& packet : record.packets)
         {
             auto sourceIt = remap.find(packet.sourceGuid);
@@ -923,6 +929,18 @@ public:
             return;
 
         MatchRecord& match = it->second;
+        if (!match.debugLoggedStart)
+        {
+            LOG_INFO("modules", "ArenaReplay: replay {} starting on bg instance {} map {} arenaType {} packets {} participants {} startTime {}",
+                replayId,
+                bg->GetInstanceID(),
+                match.mapId,
+                match.arenaTypeId,
+                match.packets.size(),
+                match.participantGuids.size(),
+                bg->GetStartTime());
+            match.debugLoggedStart = true;
+        }
 
         // if replay ends or spectator left > free arena replay data and/or kick player
         if (match.packets.empty() || bg->GetPlayers().empty())
@@ -946,12 +964,32 @@ public:
             PacketRecord const& packetRecord = match.packets.front();
             if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == replayerGuid)
             {
+                if (match.debugPacketsLogged < 50)
+                {
+                    LOG_INFO("modules", "ArenaReplay: skipping packet opcode {} size {} ts {} sourceGuid {} (matches observer guid {})",
+                        packetRecord.packet.GetOpcode(),
+                        packetRecord.packet.size(),
+                        packetRecord.timestamp,
+                        packetRecord.sourceGuid,
+                        replayerGuid);
+                    ++match.debugPacketsLogged;
+                }
                 match.packets.pop_front();
                 continue;
             }
 
             WorldPacket const* myPacket = &packetRecord.packet;
             Player* replayer = bg->GetPlayers().begin()->second;
+            if (match.debugPacketsLogged < 50)
+            {
+                LOG_INFO("modules", "ArenaReplay: sending packet opcode {} size {} ts {} sourceGuid {} to observer guid {}",
+                    myPacket->GetOpcode(),
+                    myPacket->size(),
+                    packetRecord.timestamp,
+                    packetRecord.sourceGuid,
+                    replayerGuid);
+                ++match.debugPacketsLogged;
+            }
             replayer->GetSession()->SendPacket(myPacket);
             match.packets.pop_front();
         }

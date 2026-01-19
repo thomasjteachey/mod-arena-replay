@@ -15,6 +15,9 @@
 #include "Player.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
+#if __has_include("UpdateFields.h")
+#include "UpdateFields.h"
+#endif
 #include <iomanip>
 #include <unordered_map>
 #include <unordered_set>
@@ -97,6 +100,7 @@ struct MatchRecord {
     bool invalidOpcodeLogged = false;
     bool invalidSendOpcodeLogged = false;
     bool updateObjectParseWarningLogged = false;
+    bool updateObjectLeakLogged = false;
     size_t updateObjectParseLogs = 0;
 };
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
@@ -222,30 +226,24 @@ namespace
         Corpse = 7
     };
 
-    // Field indices based on TrinityCore 3.3.5 UpdateFields.h; 0xFFFF denotes unavailable fields in this fork.
-    constexpr uint16 UNIT_FIELD_CHARM = 0x0006;
-    constexpr uint16 UNIT_FIELD_SUMMON = 0x0008;
-    constexpr uint16 UNIT_FIELD_CHARMEDBY = 0x000A;
-    constexpr uint16 UNIT_FIELD_SUMMONEDBY = 0x000C;
-    constexpr uint16 UNIT_FIELD_CREATEDBY = 0x000E;
-    constexpr uint16 UNIT_FIELD_TARGET = 0x0010;
-    constexpr uint16 UNIT_FIELD_CHANNEL_OBJECT = 0x0012;
-    constexpr uint16 UNIT_FIELD_PERSUADED = 0xFFFF;
-    constexpr std::array<uint16, 8> UNIT_GUID_FIELDS_LOW = {
+#if __has_include("UpdateFields.h")
+    constexpr std::array<uint16, 7> UNIT_GUID_FIELDS_LOW = {
         UNIT_FIELD_TARGET,
         UNIT_FIELD_CHANNEL_OBJECT,
         UNIT_FIELD_SUMMON,
         UNIT_FIELD_CHARM,
         UNIT_FIELD_CHARMEDBY,
         UNIT_FIELD_SUMMONEDBY,
-        UNIT_FIELD_CREATEDBY,
-        UNIT_FIELD_PERSUADED
+        UNIT_FIELD_CREATEDBY
     };
 
-    constexpr uint16 PLAYER_FARSIGHT = 0xFFFF;
     constexpr std::array<uint16, 1> PLAYER_GUID_FIELDS_LOW = {
         PLAYER_FARSIGHT
     };
+#else
+    constexpr std::array<uint16, 0> UNIT_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> PLAYER_GUID_FIELDS_LOW = {};
+#endif
 
     constexpr uint32 MOVEFLAG_ONTRANSPORT = 0x00000200;
     constexpr uint32 MOVEFLAG_SWIMMING = 0x00004000;
@@ -461,12 +459,8 @@ namespace
 
                 uint64 guid = (uint64(highValue) << 32) | lowValue;
                 uint64 finalGuid = guid;
-                bool isGuidField = IsGuidLowField(fieldIndex, objectTypeId);
-                bool shouldRewrite = isGuidField;
-                if (!shouldRewrite && remap && guid != 0)
-                    shouldRewrite = remap->find(guid) != remap->end();
-
-                if (shouldRewrite && remap)
+                bool isGuidField = objectTypeId != 0xFF && IsGuidLowField(fieldIndex, objectTypeId);
+                if (isGuidField && remap)
                 {
                     auto it = remap->find(guid);
                     if (it != remap->end())
@@ -619,11 +613,10 @@ namespace
 
     bool ProcessUpdateObjectPayload(std::vector<uint8> const& input, std::vector<uint8>* output,
         std::unordered_map<uint64, uint64> const* remap, std::unordered_set<uint64>* extracted,
-        UpdateObjectParseStats& stats, size_t& failureOffset)
+        std::unordered_map<uint64, uint8>* objectTypes, UpdateObjectParseStats& stats, size_t& failureOffset)
     {
         size_t offset = 0;
         std::vector<uint8> scratchOutput;
-        std::unordered_map<uint64, uint8> objectTypes;
         auto writeByte = [&](uint8 value)
         {
             if (output)
@@ -765,7 +758,8 @@ namespace
                     }
                 }
 
-                objectTypes[finalGuid] = objectTypeId;
+                if (objectTypes)
+                    (*objectTypes)[finalGuid] = objectTypeId;
 
                 if (output)
                 {
@@ -804,9 +798,12 @@ namespace
             else if (updateType == UpdateType::Values)
             {
                 uint8 objectTypeId = 0xFF;
-                auto typeIt = objectTypes.find(finalGuid);
-                if (typeIt != objectTypes.end())
-                    objectTypeId = typeIt->second;
+                if (objectTypes)
+                {
+                    auto typeIt = objectTypes->find(finalGuid);
+                    if (typeIt != objectTypes->end())
+                        objectTypeId = typeIt->second;
+                }
 
                 if (output)
                 {
@@ -864,7 +861,7 @@ namespace
     }
 
     bool RewriteUpdateObjectPacket(WorldPacket& packet, std::unordered_map<uint64, uint64> const& remap,
-        UpdateObjectParseStats& stats, size_t& failureOffset)
+        std::unordered_map<uint64, uint8>& objectTypes, UpdateObjectParseStats& stats, size_t& failureOffset)
     {
         size_t packetSize = packet.size();
         if (packetSize == 0)
@@ -878,7 +875,7 @@ namespace
         std::vector<uint8> output;
         output.reserve(input.size());
 
-        if (!ProcessUpdateObjectPayload(input, &output, &remap, nullptr, stats, failureOffset))
+        if (!ProcessUpdateObjectPayload(input, &output, &remap, nullptr, &objectTypes, stats, failureOffset))
             return false;
 
         WorldPacket updated(packet.GetOpcode(), output.size());
@@ -890,7 +887,7 @@ namespace
     }
 
     bool RewriteCompressedUpdateObjectPacket(WorldPacket& packet, std::unordered_map<uint64, uint64> const& remap,
-        UpdateObjectParseStats& stats, size_t& failureOffset)
+        std::unordered_map<uint64, uint8>& objectTypes, UpdateObjectParseStats& stats, size_t& failureOffset)
     {
         size_t packetSize = packet.size();
         if (packetSize == 0)
@@ -908,7 +905,7 @@ namespace
 
         std::vector<uint8> rewritten;
         rewritten.reserve(decompressed.size());
-        if (!ProcessUpdateObjectPayload(decompressed, &rewritten, &remap, nullptr, stats, failureOffset))
+        if (!ProcessUpdateObjectPayload(decompressed, &rewritten, &remap, nullptr, &objectTypes, stats, failureOffset))
             return false;
 
         std::vector<uint8> recompressed;
@@ -926,7 +923,7 @@ namespace
     bool ExtractGuidsFromUpdateObjectPayload(std::vector<uint8> const& input, std::unordered_set<uint64>& guids,
         UpdateObjectParseStats& stats, size_t& failureOffset)
     {
-        return ProcessUpdateObjectPayload(input, nullptr, nullptr, &guids, stats, failureOffset);
+        return ProcessUpdateObjectPayload(input, nullptr, nullptr, &guids, nullptr, stats, failureOffset);
     }
 
     bool ExtractGuidsFromPacket(WorldPacket const& packet, std::unordered_set<uint64>& guids, UpdateObjectParseStats& stats,
@@ -1541,11 +1538,12 @@ namespace
         if (packet.GetOpcode() == SMSG_UPDATE_OBJECT || packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
         {
             std::unordered_map<uint64, uint64> remap{ { fromGuid, toGuid } };
+            std::unordered_map<uint64, uint8> objectTypes;
             UpdateObjectParseStats stats;
             size_t failureOffset = 0;
             if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
-                return RewriteUpdateObjectPacket(packet, remap, stats, failureOffset);
-            return RewriteCompressedUpdateObjectPacket(packet, remap, stats, failureOffset);
+                return RewriteUpdateObjectPacket(packet, remap, objectTypes, stats, failureOffset);
+            return RewriteCompressedUpdateObjectPacket(packet, remap, objectTypes, stats, failureOffset);
         }
 
         return RewriteRawPacket(packet, fromGuid, toGuid);
@@ -1587,6 +1585,8 @@ namespace
         std::unordered_set<uint64> usedGuids = BuildUsedGuidSet(record);
         std::unordered_map<uint64, uint64> remap;
         remap.reserve(record.participantGuids.size());
+        std::unordered_map<uint64, uint8> objectTypes;
+        objectTypes.reserve(2048);
 
         for (uint64 guid : record.participantGuids)
         {
@@ -1626,9 +1626,9 @@ namespace
                 size_t failureOffset = 0;
                 bool rewritten = false;
                 if (packet.packet.GetOpcode() == SMSG_UPDATE_OBJECT)
-                    rewritten = RewriteUpdateObjectPacket(packet.packet, record.guidRemap, stats, failureOffset);
+                    rewritten = RewriteUpdateObjectPacket(packet.packet, record.guidRemap, objectTypes, stats, failureOffset);
                 else
-                    rewritten = RewriteCompressedUpdateObjectPacket(packet.packet, record.guidRemap, stats, failureOffset);
+                    rewritten = RewriteCompressedUpdateObjectPacket(packet.packet, record.guidRemap, objectTypes, stats, failureOffset);
 
                 if (rewritten)
                 {
@@ -1640,6 +1640,37 @@ namespace
                             stats.blockCount,
                             stats.bytesConsumed);
                         ++record.updateObjectParseLogs;
+                    }
+
+                    if (!record.updateObjectLeakLogged)
+                    {
+                        std::vector<uint8> buffer(packet.packet.contents(), packet.packet.contents() + packet.packet.size());
+                        std::vector<uint8> payload;
+                        bool decompressed = true;
+                        if (packet.packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+                        {
+                            decompressed = Decompress(buffer, payload);
+                        }
+                        else
+                        {
+                            payload = std::move(buffer);
+                        }
+
+                        if (decompressed)
+                        {
+                            for (auto const& entry : record.guidRemap)
+                            {
+                                if (ContainsGuidSequences(payload, entry.first, false))
+                                {
+                                    LOG_ERROR("modules", "ArenaReplay: GUID leak detected in replay {} opcode {} guid {}",
+                                        record.replayId,
+                                        packet.packet.GetOpcode(),
+                                        entry.first);
+                                    record.updateObjectLeakLogged = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 else if (!record.updateObjectParseWarningLogged)

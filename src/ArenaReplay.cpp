@@ -105,6 +105,7 @@ struct MatchRecord {
     uint32 mapId;
     std::deque<PacketRecord> packets;
     std::vector<uint64> participantGuids;
+    std::unordered_map<uint64, uint64> guidRemap;
     bool debugLoggedStart = false;
     size_t debugPacketsLogged = 0;
 };
@@ -753,7 +754,10 @@ namespace
         {
             std::vector<uint8> decompressed;
             if (!Decompress(buffer, decompressed))
-                return true;
+            {
+                LOG_WARN("modules", "ArenaReplay: failed to decompress SMSG_COMPRESSED_UPDATE_OBJECT while searching for guid {}", guid);
+                return false;
+            }
 
             return ContainsGuidSequences(decompressed, guid);
         }
@@ -828,17 +832,19 @@ namespace
                 guid = it->second;
         }
 
+        record.guidRemap = std::move(remap);
+
         LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
-            remap.size(),
+            record.guidRemap.size(),
             record.packets.size());
 
         for (PacketRecord& packet : record.packets)
         {
-            auto sourceIt = remap.find(packet.sourceGuid);
-            if (sourceIt != remap.end())
+            auto sourceIt = record.guidRemap.find(packet.sourceGuid);
+            if (sourceIt != record.guidRemap.end())
                 packet.sourceGuid = sourceIt->second;
 
-            for (auto const& entry : remap)
+            for (auto const& entry : record.guidRemap)
                 ReplaceGuidInPacket(packet.packet, entry.first, entry.second);
         }
     }
@@ -983,7 +989,11 @@ public:
         }
 
         //send replay data to spectator
-        const uint64 replayerGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+        const uint64 observerRealGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+        uint64 observerGhostGuid = observerRealGuid;
+        auto remapIt = match.guidRemap.find(observerRealGuid);
+        if (remapIt != match.guidRemap.end())
+            observerGhostGuid = remapIt->second;
 
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
@@ -991,16 +1001,17 @@ public:
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
-            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == replayerGuid)
+            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == observerGhostGuid)
             {
                 if (match.debugPacketsLogged < 50)
                 {
-                    LOG_INFO("modules", "ArenaReplay: skipping packet opcode {} size {} ts {} sourceGuid {} (matches observer guid {})",
+                    LOG_INFO("modules", "ArenaReplay: skipping packet opcode {} size {} ts {} sourceGuid {} (matches observer ghost guid {} real {})",
                         packetRecord.packet.GetOpcode(),
                         packetRecord.packet.size(),
                         packetRecord.timestamp,
                         packetRecord.sourceGuid,
-                        replayerGuid);
+                        observerGhostGuid,
+                        observerRealGuid);
                     ++match.debugPacketsLogged;
                 }
                 match.packets.pop_front();
@@ -1016,7 +1027,7 @@ public:
                     myPacket->size(),
                     packetRecord.timestamp,
                     packetRecord.sourceGuid,
-                    replayerGuid);
+                    observerRealGuid);
                 ++match.debugPacketsLogged;
             }
             replayer->GetSession()->SendPacket(myPacket);

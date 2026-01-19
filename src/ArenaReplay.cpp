@@ -770,12 +770,11 @@ namespace
         return used;
     }
 
-    void RemapReplayGuids(MatchRecord& record)
+    void RemapReplayGuids(MatchRecord& record, uint64 viewerGuid)
     {
-        if (record.participantGuids.empty())
-            return;
-
         std::unordered_set<uint64> usedGuids = BuildUsedGuidSet(record);
+        if (viewerGuid != 0)
+            usedGuids.insert(viewerGuid);
         std::unordered_map<uint64, uint64> remap;
         remap.reserve(record.participantGuids.size());
 
@@ -799,9 +798,32 @@ namespace
                 guid = it->second;
         }
 
-        LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
-            remap.size(),
-            record.packets.size());
+        if (viewerGuid != 0 && remap.find(viewerGuid) == remap.end())
+        {
+            bool viewerGuidFound = false;
+            for (PacketRecord const& packet : record.packets)
+            {
+                if (PacketContainsGuid(packet.packet, viewerGuid))
+                {
+                    viewerGuidFound = true;
+                    break;
+                }
+            }
+
+            if (viewerGuidFound)
+            {
+                uint64 ghostGuid = GenerateGhostGuid(viewerGuid, usedGuids);
+                usedGuids.insert(ghostGuid);
+                remap.emplace(viewerGuid, ghostGuid);
+            }
+        }
+
+        if (!remap.empty())
+        {
+            LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
+                remap.size(),
+                record.packets.size());
+        }
 
         for (PacketRecord& packet : record.packets)
         {
@@ -1896,7 +1918,7 @@ private:
         timesWatched++;
         CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
 
-        RemapReplayGuids(record);
+        RemapReplayGuids(record, p->GetGUID().GetRawValue());
 
         loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
         return true;

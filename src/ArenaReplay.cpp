@@ -603,7 +603,7 @@ namespace
         return false;
     }
 
-    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
+    bool ReplaceRawGuidOccurrences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
     {
         if (payload.empty())
             return false;
@@ -612,13 +612,74 @@ namespace
         auto toBytesArray = GetGuidBytes(toGuid);
         std::vector<uint8> fromBytes(fromBytesArray.begin(), fromBytesArray.end());
         std::vector<uint8> toBytes(toBytesArray.begin(), toBytesArray.end());
-        std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
+
+        return ReplaceSequence(payload, fromBytes, toBytes);
+    }
+
+    bool ReplacePackedGuidOccurrences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
+    {
+        if (payload.empty())
+            return false;
+
         std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
+        if (toPacked.empty())
+            return false;
 
-        bool modified = ReplaceSequence(payload, fromBytes, toBytes);
+        bool modified = false;
+        size_t index = 0;
+        while (index < payload.size())
+        {
+            uint8 mask = payload[index];
+            if (mask == 0)
+            {
+                ++index;
+                continue;
+            }
 
-        if (!fromPacked.empty() && !toPacked.empty())
-            modified |= ReplaceSequence(payload, fromPacked, toPacked);
+            uint8 byteCount = 0;
+            for (uint8 bit = 0; bit < 8; ++bit)
+                if (mask & (1u << bit))
+                    ++byteCount;
+
+            if (index + 1 + byteCount > payload.size())
+            {
+                ++index;
+                continue;
+            }
+
+            std::array<uint8, 8> bytes{};
+            size_t cursor = index + 1;
+            for (uint8 bit = 0; bit < 8; ++bit)
+            {
+                if (mask & (1u << bit))
+                    bytes[bit] = payload[cursor++];
+            }
+
+            if (BuildGuidFromBytes(bytes) == fromGuid)
+            {
+                payload.erase(payload.begin() + index, payload.begin() + index + 1 + byteCount);
+                payload.insert(payload.begin() + index, toPacked.begin(), toPacked.end());
+                index += toPacked.size();
+                modified = true;
+                continue;
+            }
+
+            ++index;
+        }
+
+        return modified;
+    }
+
+    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid, bool allowRaw)
+    {
+        if (payload.empty())
+            return false;
+
+        bool modified = false;
+        if (allowRaw)
+            modified |= ReplaceRawGuidOccurrences(payload, fromGuid, toGuid);
+
+        modified |= ReplacePackedGuidOccurrences(payload, fromGuid, toGuid);
 
         return modified;
     }
@@ -670,7 +731,7 @@ namespace
         if (!Decompress(buffer, decompressed))
             return false;
 
-        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
+        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid, false))
             return false;
 
         std::vector<uint8> recompressed;
@@ -685,7 +746,7 @@ namespace
         return true;
     }
 
-    bool RewriteRawPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    bool RewriteRawPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid, bool allowRaw)
     {
         size_t packetSize = packet.size();
         if (packetSize == 0)
@@ -696,7 +757,7 @@ namespace
             return false;
 
         std::vector<uint8> buffer(contents, contents + packetSize);
-        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid))
+        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid, allowRaw))
             return false;
 
         WorldPacket updated(packet.GetOpcode(), buffer.size());
@@ -757,7 +818,10 @@ namespace
         if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
             return RewriteCompressedPacket(packet, fromGuid, toGuid);
 
-        return RewriteRawPacket(packet, fromGuid, toGuid);
+        if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
+            return RewriteRawPacket(packet, fromGuid, toGuid, false);
+
+        return RewriteRawPacket(packet, fromGuid, toGuid, true);
     }
 
     std::unordered_set<uint64> BuildUsedGuidSet(MatchRecord const& record)
@@ -770,12 +834,11 @@ namespace
         return used;
     }
 
-    void RemapReplayGuids(MatchRecord& record)
+    void RemapReplayGuids(MatchRecord& record, uint64 viewerGuid)
     {
-        if (record.participantGuids.empty())
-            return;
-
         std::unordered_set<uint64> usedGuids = BuildUsedGuidSet(record);
+        if (viewerGuid != 0)
+            usedGuids.insert(viewerGuid);
         std::unordered_map<uint64, uint64> remap;
         remap.reserve(record.participantGuids.size());
 
@@ -799,9 +862,32 @@ namespace
                 guid = it->second;
         }
 
-        LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
-            remap.size(),
-            record.packets.size());
+        if (viewerGuid != 0 && remap.find(viewerGuid) == remap.end())
+        {
+            bool viewerGuidFound = false;
+            for (PacketRecord const& packet : record.packets)
+            {
+                if (PacketContainsGuid(packet.packet, viewerGuid))
+                {
+                    viewerGuidFound = true;
+                    break;
+                }
+            }
+
+            if (viewerGuidFound)
+            {
+                uint64 ghostGuid = GenerateGhostGuid(viewerGuid, usedGuids);
+                usedGuids.insert(ghostGuid);
+                remap.emplace(viewerGuid, ghostGuid);
+            }
+        }
+
+        if (!remap.empty())
+        {
+            LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
+                remap.size(),
+                record.packets.size());
+        }
 
         for (PacketRecord& packet : record.packets)
         {
@@ -1896,7 +1982,7 @@ private:
         timesWatched++;
         CharacterDatabase.Execute("UPDATE character_arena_replays SET timesWatched = {} WHERE id = {}", timesWatched, matchId);
 
-        RemapReplayGuids(record);
+        RemapReplayGuids(record, p->GetGUID().GetRawValue());
 
         loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
         return true;

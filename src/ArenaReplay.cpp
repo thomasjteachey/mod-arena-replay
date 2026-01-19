@@ -599,7 +599,7 @@ namespace
         return candidate;
     }
 
-    bool ContainsGuidSequences(std::vector<uint8> const& payload, uint64 guid)
+    bool ContainsGuidSequences(std::vector<uint8> const& payload, uint64 guid, bool allowRaw)
     {
         if (payload.empty() || guid == 0)
             return false;
@@ -608,7 +608,7 @@ namespace
         std::vector<uint8> raw(bytesArray.begin(), bytesArray.end());
         std::vector<uint8> packed = GetPackedGuidBytes(guid);
 
-        if (ContainsSequence(payload, raw))
+        if (allowRaw && ContainsSequence(payload, raw))
             return true;
 
         if (!packed.empty() && ContainsSequence(payload, packed))
@@ -759,21 +759,21 @@ namespace
                 return false;
             }
 
-            return ContainsGuidSequences(decompressed, guid);
+            return ContainsGuidSequences(decompressed, guid, false);
         }
 
         if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
-            return ContainsGuidSequences(buffer, guid);
+            return ContainsGuidSequences(buffer, guid, false);
 
         if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
         {
             if (MultipacketPayloadContainsGuid(buffer, guid))
                 return true;
 
-            return ContainsGuidSequences(buffer, guid);
+            return ContainsGuidSequences(buffer, guid, true);
         }
 
-        return ContainsGuidSequences(buffer, guid);
+        return ContainsGuidSequences(buffer, guid, true);
     }
 
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
@@ -990,10 +990,14 @@ public:
 
         //send replay data to spectator
         const uint64 observerRealGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+        bool observerIsParticipant = false;
         uint64 observerGhostGuid = observerRealGuid;
         auto remapIt = match.guidRemap.find(observerRealGuid);
         if (remapIt != match.guidRemap.end())
+        {
             observerGhostGuid = remapIt->second;
+            observerIsParticipant = true;
+        }
 
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
@@ -1001,7 +1005,7 @@ public:
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
-            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == observerGhostGuid)
+            if (observerIsParticipant && packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == observerGhostGuid)
             {
                 if (match.debugPacketsLogged < 50)
                 {

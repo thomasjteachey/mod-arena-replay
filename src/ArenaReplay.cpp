@@ -798,6 +798,19 @@ namespace
                 guid = it->second;
         }
 
+        for (PacketRecord const& packet : record.packets)
+        {
+            if (packet.sourceGuid == 0)
+                continue;
+
+            if (remap.find(packet.sourceGuid) != remap.end())
+                continue;
+
+            uint64 ghostGuid = GenerateGhostGuid(packet.sourceGuid, usedGuids);
+            usedGuids.insert(ghostGuid);
+            remap.emplace(packet.sourceGuid, ghostGuid);
+        }
+
         if (viewerGuid != 0 && remap.find(viewerGuid) == remap.end())
         {
             bool viewerGuidFound = false;
@@ -984,22 +997,6 @@ public:
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
-            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == replayerGuid)
-            {
-                if (match.debugPacketsLogged < 50)
-                {
-                    LOG_INFO("modules", "ArenaReplay: skipping packet opcode {} size {} ts {} sourceGuid {} (matches observer guid {})",
-                        packetRecord.packet.GetOpcode(),
-                        packetRecord.packet.size(),
-                        packetRecord.timestamp,
-                        packetRecord.sourceGuid,
-                        replayerGuid);
-                    ++match.debugPacketsLogged;
-                }
-                match.packets.pop_front();
-                continue;
-            }
-
             WorldPacket const* myPacket = &packetRecord.packet;
             Player* replayer = bg->GetPlayers().begin()->second;
             if (match.debugPacketsLogged < 50)

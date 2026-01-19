@@ -262,32 +262,21 @@ records[instanceId].hasCreate[member->GetGUID()] = createPkt;
                 buffer.append(pr.packet.contents(), pr.packet.size());
         }
 
-        float startX = 0, startY = 0, startZ = 0, startO = 0;
-        if (map->GetPlayers().getSize() > 0)
-        {
-            if (Player* first = map->GetPlayers().begin()->GetSource())
-            {
-                startX = first->GetPositionX();
-                startY = first->GetPositionY();
-                startZ = first->GetPositionZ();
-                startO = first->GetOrientation();
-            }
-        }
-
         std::string encoded = Acore::Encoding::Base32::Encode(
             std::vector<uint8>(buffer.contents(), buffer.contents() + buffer.size())
         );
 
         CharacterDatabase.Execute(
-            "INSERT INTO `character_raid_replays` "
-            "(`mapId`, `encounterId`, `contentSize`, `contents`, `playerGuids`, `startX`, `startY`, `startZ`, `startO`) "
-            "VALUES ({}, {}, {}, '{}', '{}', {}, {}, {}, {})",
-            match.mapId,
+            "INSERT INTO `character_arena_replays` "
+            "(`arenaTypeId`, `typeId`, `contentSize`, `contents`, `mapId`, `winnerPlayerGuids`, `loserPlayerGuids`) "
+            "VALUES ({}, {}, {}, '{}', {}, '{}', '{}')",
+            0,
             match.encounterId,
             buffer.size(),
             encoded,
+            match.mapId,
             playerGuids,
-            startX, startY, startZ, startO
+            ""
         );
 
         handler->PSendSysMessage("✅ Recording stoppé et sauvegardé (packets: %u).", (uint32)match.packets.size());
@@ -328,8 +317,8 @@ static bool HandleMakeSpec(ChatHandler* handler) {
             return false;
 
         QueryResult result = CharacterDatabase.Query(
-            "SELECT mapId, encounterId, contentSize, contents, playerGuids, startX, startY, startZ, startO "
-            "FROM character_raid_replays WHERE id = {}", replayId);
+            "SELECT mapId, typeId, contentSize, contents, winnerPlayerGuids, loserPlayerGuids "
+            "FROM character_arena_replays WHERE id = {}", replayId);
 
         if (!result)
         {
@@ -342,11 +331,15 @@ static bool HandleMakeSpec(ChatHandler* handler) {
         uint32 encounter   = fields[1].Get<uint32>();
         uint32 contentSize = fields[2].Get<uint32>();
         std::string contents   = fields[3].Get<std::string>();
-        std::string playerGuids = fields[4].Get<std::string>();
-        float startX = fields[5].Get<float>();
-        float startY = fields[6].Get<float>();
-        float startZ = fields[7].Get<float>();
-        float startO = fields[8].Get<float>();
+        std::string winnerPlayerGuids = fields[4].Get<std::string>();
+        std::string loserPlayerGuids = fields[5].Get<std::string>();
+        std::string playerGuids = winnerPlayerGuids;
+        if (!loserPlayerGuids.empty())
+        {
+            if (!playerGuids.empty())
+                playerGuids += ",";
+            playerGuids += loserPlayerGuids;
+        }
 
         std::vector<uint8> data = *Acore::Encoding::Base32::Decode(contents);
         ByteBuffer buffer;

@@ -105,6 +105,7 @@ struct MatchRecord {
     uint32 mapId;
     std::deque<PacketRecord> packets;
     std::vector<uint64> participantGuids;
+    std::unordered_map<uint64, uint64> guidRemap;
     bool debugLoggedStart = false;
     size_t debugPacketsLogged = 0;
 };
@@ -172,6 +173,15 @@ namespace
 
         packed.insert(packed.begin(), mask);
         return packed;
+    }
+
+    uint8 GetPackedMask(uint64 guid)
+    {
+        std::vector<uint8> packed = GetPackedGuidBytes(guid);
+        if (packed.empty())
+            return 0;
+
+        return packed.front();
     }
 
     bool ContainsSequence(std::vector<uint8> const& buffer, std::vector<uint8> const& sequence)
@@ -519,6 +529,7 @@ namespace
     uint64 GenerateGhostGuid(uint64 originalGuid, std::unordered_set<uint64> const& usedGuids)
     {
         auto originalBytes = GetGuidBytes(originalGuid);
+        uint8 originalMask = GetPackedMask(originalGuid);
         std::vector<size_t> nonZeroIndices;
         nonZeroIndices.reserve(originalBytes.size());
         for (size_t i = 0; i < originalBytes.size(); ++i)
@@ -572,6 +583,9 @@ namespace
             if (candidate == 0 || candidate == originalGuid)
                 continue;
 
+            if (GetPackedMask(candidate) != originalMask)
+                continue;
+
             if (usedGuids.find(candidate) == usedGuids.end())
                 return candidate;
         }
@@ -580,12 +594,12 @@ namespace
         do
         {
             ++candidate;
-        } while (candidate == 0 || usedGuids.find(candidate) != usedGuids.end());
+        } while (candidate == 0 || usedGuids.find(candidate) != usedGuids.end() || GetPackedMask(candidate) != originalMask);
 
         return candidate;
     }
 
-    bool ContainsGuidSequences(std::vector<uint8> const& payload, uint64 guid)
+    bool ContainsGuidSequences(std::vector<uint8> const& payload, uint64 guid, bool allowRaw)
     {
         if (payload.empty() || guid == 0)
             return false;
@@ -594,7 +608,7 @@ namespace
         std::vector<uint8> raw(bytesArray.begin(), bytesArray.end());
         std::vector<uint8> packed = GetPackedGuidBytes(guid);
 
-        if (ContainsSequence(payload, raw))
+        if (allowRaw && ContainsSequence(payload, raw))
             return true;
 
         if (!packed.empty() && ContainsSequence(payload, packed))
@@ -603,7 +617,7 @@ namespace
         return false;
     }
 
-    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid)
+    bool ReplaceGuidSequences(std::vector<uint8>& payload, uint64 fromGuid, uint64 toGuid, bool allowRaw)
     {
         if (payload.empty())
             return false;
@@ -615,10 +629,25 @@ namespace
         std::vector<uint8> fromPacked = GetPackedGuidBytes(fromGuid);
         std::vector<uint8> toPacked = GetPackedGuidBytes(toGuid);
 
-        bool modified = ReplaceSequence(payload, fromBytes, toBytes);
+        bool modified = false;
+        if (allowRaw)
+            modified |= ReplaceSequence(payload, fromBytes, toBytes);
 
         if (!fromPacked.empty() && !toPacked.empty())
-            modified |= ReplaceSequence(payload, fromPacked, toPacked);
+        {
+            if (fromPacked.size() == toPacked.size() && fromPacked.front() == toPacked.front())
+            {
+                modified |= ReplaceSequence(payload, fromPacked, toPacked);
+            }
+            else
+            {
+                LOG_WARN("modules", "ArenaReplay: packed GUID shape mismatch (from mask {:02X} size {}, to mask {:02X} size {}), skipping packed replacement",
+                    fromPacked.front(),
+                    fromPacked.size(),
+                    toPacked.front(),
+                    toPacked.size());
+            }
+        }
 
         return modified;
     }
@@ -670,7 +699,7 @@ namespace
         if (!Decompress(buffer, decompressed))
             return false;
 
-        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid))
+        if (!ReplaceGuidSequences(decompressed, fromGuid, toGuid, false))
             return false;
 
         std::vector<uint8> recompressed;
@@ -696,7 +725,8 @@ namespace
             return false;
 
         std::vector<uint8> buffer(contents, contents + packetSize);
-        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid))
+        bool allowRaw = packet.GetOpcode() != SMSG_UPDATE_OBJECT;
+        if (!ReplaceGuidSequences(buffer, fromGuid, toGuid, allowRaw))
             return false;
 
         WorldPacket updated(packet.GetOpcode(), buffer.size());
@@ -724,23 +754,26 @@ namespace
         {
             std::vector<uint8> decompressed;
             if (!Decompress(buffer, decompressed))
-                return true;
+            {
+                LOG_WARN("modules", "ArenaReplay: failed to decompress SMSG_COMPRESSED_UPDATE_OBJECT while searching for guid {}", guid);
+                return false;
+            }
 
-            return ContainsGuidSequences(decompressed, guid);
+            return ContainsGuidSequences(decompressed, guid, false);
         }
 
         if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
-            return ContainsGuidSequences(buffer, guid);
+            return ContainsGuidSequences(buffer, guid, false);
 
         if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
         {
             if (MultipacketPayloadContainsGuid(buffer, guid))
                 return true;
 
-            return ContainsGuidSequences(buffer, guid);
+            return ContainsGuidSequences(buffer, guid, true);
         }
 
-        return ContainsGuidSequences(buffer, guid);
+        return ContainsGuidSequences(buffer, guid, true);
     }
 
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
@@ -799,17 +832,19 @@ namespace
                 guid = it->second;
         }
 
+        record.guidRemap = std::move(remap);
+
         LOG_INFO("modules", "ArenaReplay: remapped {} participant GUIDs ({} packets) to ghost GUIDs",
-            remap.size(),
+            record.guidRemap.size(),
             record.packets.size());
 
         for (PacketRecord& packet : record.packets)
         {
-            auto sourceIt = remap.find(packet.sourceGuid);
-            if (sourceIt != remap.end())
+            auto sourceIt = record.guidRemap.find(packet.sourceGuid);
+            if (sourceIt != record.guidRemap.end())
                 packet.sourceGuid = sourceIt->second;
 
-            for (auto const& entry : remap)
+            for (auto const& entry : record.guidRemap)
                 ReplaceGuidInPacket(packet.packet, entry.first, entry.second);
         }
     }
@@ -954,7 +989,15 @@ public:
         }
 
         //send replay data to spectator
-        const uint64 replayerGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+        const uint64 observerRealGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+        bool observerIsParticipant = false;
+        uint64 observerGhostGuid = observerRealGuid;
+        auto remapIt = match.guidRemap.find(observerRealGuid);
+        if (remapIt != match.guidRemap.end())
+        {
+            observerGhostGuid = remapIt->second;
+            observerIsParticipant = true;
+        }
 
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
@@ -962,16 +1005,17 @@ public:
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
-            if (packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == replayerGuid)
+            if (observerIsParticipant && packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == observerGhostGuid)
             {
                 if (match.debugPacketsLogged < 50)
                 {
-                    LOG_INFO("modules", "ArenaReplay: skipping packet opcode {} size {} ts {} sourceGuid {} (matches observer guid {})",
+                    LOG_INFO("modules", "ArenaReplay: skipping packet opcode {} size {} ts {} sourceGuid {} (matches observer ghost guid {} real {})",
                         packetRecord.packet.GetOpcode(),
                         packetRecord.packet.size(),
                         packetRecord.timestamp,
                         packetRecord.sourceGuid,
-                        replayerGuid);
+                        observerGhostGuid,
+                        observerRealGuid);
                     ++match.debugPacketsLogged;
                 }
                 match.packets.pop_front();
@@ -987,7 +1031,7 @@ public:
                     myPacket->size(),
                     packetRecord.timestamp,
                     packetRecord.sourceGuid,
-                    replayerGuid);
+                    observerRealGuid);
                 ++match.debugPacketsLogged;
             }
             replayer->GetSession()->SendPacket(myPacket);

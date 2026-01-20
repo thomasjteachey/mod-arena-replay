@@ -2953,7 +2953,7 @@ private:
 
         uint32 queueSlot = player->AddBattlegroundQueueId(queueTypeId);
 
-        player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, TEAM_NEUTRAL);
+        player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, teamId);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
         LOG_INFO("modules", "ArenaReplay: requested join replay {} bgInstance {} queueSlot {} player {}",

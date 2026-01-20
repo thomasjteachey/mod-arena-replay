@@ -1956,7 +1956,16 @@ public:
         }
 
         if (!bg->GetPlayers().empty())
+        {
+            if (!match.observerJoined)
+            {
+                LOG_INFO("modules", "ArenaReplay: observer joined bgInstance {} matchId {} players {}",
+                    bg->GetInstanceID(),
+                    replayId,
+                    bg->GetPlayers().size());
+            }
             match.observerJoined = true;
+        }
 
         if (match.packets.empty())
         {
@@ -2079,6 +2088,18 @@ public:
     {
         if (!player)
             return;
+
+        auto replayIt = bgReplayIds.find(bg->GetInstanceID());
+        if (replayIt != bgReplayIds.end())
+        {
+            LOG_INFO("modules", "ArenaReplay: AddPlayer bgInstance {} player {} replay {}",
+                bg->GetInstanceID(),
+                player->GetGUID().GetRawValue(),
+                replayIt->second);
+            if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
+                bg->StartBattleground();
+            return;
+        }
 
         if (player->IsSpectator())
             return;
@@ -2925,20 +2946,21 @@ private:
 
         bgReplayIds[bg->GetInstanceID()] = replayId;
         player->SetPendingSpectatorForBG(bg->GetInstanceID());
+        CloseGossipMenuFor(player);
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
+        BattlegroundQueueTypeId queueTypeId = BattlegroundMgr::BGQueueTypeId(bgTypeId, bg->GetArenaType());
 
-        TeamId teamId = Player::TeamIdForRace(player->getRace());
-
-        uint32 queueSlot = 0;
-        WorldPacket data;
+        uint32 queueSlot = player->AddBattlegroundQueueId(queueTypeId);
 
         player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, TEAM_NEUTRAL);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
-        bg->StartBattleground();
-        sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0, bg->GetStartTime(), bg->GetArenaType(), teamId);
-        player->GetSession()->SendPacket(&data);
+        LOG_INFO("modules", "ArenaReplay: requested join replay {} bgInstance {} queueSlot {} player {}",
+            replayId,
+            bg->GetInstanceID(),
+            queueSlot,
+            player->GetGUID().GetRawValue());
         handler.PSendSysMessage("Replay ID {} begins.", replayId);
 
         return true;

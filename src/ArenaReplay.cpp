@@ -2080,6 +2080,10 @@ public:
         if (!player)
             return;
 
+        const bool isReplay = bgReplayIds.find(bg->GetInstanceID()) != bgReplayIds.end();
+        if (isReplay && bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
+            bg->StartBattleground();
+
         if (player->IsSpectator())
             return;
 
@@ -2930,15 +2934,11 @@ private:
 
         TeamId teamId = Player::TeamIdForRace(player->getRace());
 
-        uint32 queueSlot = 0;
-        WorldPacket data;
+        uint32 queueSlot = player->AddBattlegroundQueueId(bg->GetQueueId());
 
-        player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, TEAM_NEUTRAL);
+        player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, teamId);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
-        bg->StartBattleground();
-        sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0, bg->GetStartTime(), bg->GetArenaType(), teamId);
-        player->GetSession()->SendPacket(&data);
         handler.PSendSysMessage("Replay ID {} begins.", replayId);
 
         return true;

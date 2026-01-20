@@ -84,7 +84,7 @@ SMSG_PLAY_SPELL_VISUAL
 CMSG_ATTACKSWING
 CMSG_ATTACKSTOP*/
 
-struct PacketRecord { uint32 timestamp; WorldPacket packet; uint64 sourceGuid = 0; };
+struct PacketRecord { uint32 timestamp; WorldPacket packet; uint64 sourceGuid = 0; bool drop = false; };
 struct MatchRecord {
     BattlegroundTypeId typeId;
     uint8 arenaTypeId;
@@ -101,6 +101,7 @@ struct MatchRecord {
     bool invalidSendOpcodeLogged = false;
     bool updateObjectParseWarningLogged = false;
     bool updateObjectLeakLogged = false;
+    bool guidLeakDropLogged = false;
     size_t updateObjectParseLogs = 0;
 };
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
@@ -240,9 +241,32 @@ namespace
     constexpr std::array<uint16, 1> PLAYER_GUID_FIELDS_LOW = {
         PLAYER_FARSIGHT
     };
+
+    constexpr std::array<uint16, 1> GAMEOBJECT_GUID_FIELDS_LOW = {
+        GAMEOBJECT_FIELD_CREATED_BY
+    };
+
+    constexpr std::array<uint16, 1> DYNAMICOBJECT_GUID_FIELDS_LOW = {
+        DYNAMICOBJECT_CASTER
+    };
+
+    constexpr std::array<uint16, 1> CORPSE_GUID_FIELDS_LOW = {
+        CORPSE_FIELD_OWNER
+    };
+
+    constexpr std::array<uint16, 4> ITEM_GUID_FIELDS_LOW = {
+        ITEM_FIELD_OWNER,
+        ITEM_FIELD_CONTAINED,
+        ITEM_FIELD_CREATOR,
+        ITEM_FIELD_GIFTCREATOR
+    };
 #else
     constexpr std::array<uint16, 0> UNIT_GUID_FIELDS_LOW = {};
     constexpr std::array<uint16, 0> PLAYER_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> GAMEOBJECT_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> DYNAMICOBJECT_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> CORPSE_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> ITEM_GUID_FIELDS_LOW = {};
 #endif
 
     constexpr uint32 MOVEFLAG_ONTRANSPORT = 0x00000200;
@@ -259,6 +283,18 @@ namespace
 
         if (objectTypeId == static_cast<uint8>(TypeId::Player))
             return std::find(PLAYER_GUID_FIELDS_LOW.begin(), PLAYER_GUID_FIELDS_LOW.end(), fieldIndex) != PLAYER_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::GameObject))
+            return std::find(GAMEOBJECT_GUID_FIELDS_LOW.begin(), GAMEOBJECT_GUID_FIELDS_LOW.end(), fieldIndex) != GAMEOBJECT_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::DynamicObject))
+            return std::find(DYNAMICOBJECT_GUID_FIELDS_LOW.begin(), DYNAMICOBJECT_GUID_FIELDS_LOW.end(), fieldIndex) != DYNAMICOBJECT_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::Corpse))
+            return std::find(CORPSE_GUID_FIELDS_LOW.begin(), CORPSE_GUID_FIELDS_LOW.end(), fieldIndex) != CORPSE_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::Item) || objectTypeId == static_cast<uint8>(TypeId::Container))
+            return std::find(ITEM_GUID_FIELDS_LOW.begin(), ITEM_GUID_FIELDS_LOW.end(), fieldIndex) != ITEM_GUID_FIELDS_LOW.end();
 
         return false;
     }
@@ -1534,6 +1570,21 @@ namespace
         return ContainsGuidSequences(buffer, guid, true);
     }
 
+    bool PacketContainsAnyOriginalGuid(WorldPacket const& packet, std::unordered_map<uint64, uint64> const& guidRemap)
+    {
+        for (auto const& entry : guidRemap)
+        {
+            uint64 original = entry.first;
+            if (original == 0)
+                continue;
+
+            if (PacketContainsGuid(packet, original))
+                return true;
+        }
+
+        return false;
+    }
+
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid, std::unordered_map<uint64, uint8>* objectTypes)
     {
         if (fromGuid == toGuid)
@@ -1694,11 +1745,55 @@ namespace
                     record.updateObjectParseWarningLogged = true;
                 }
 
+                if (PacketContainsAnyOriginalGuid(packet.packet, record.guidRemap))
+                {
+                    packet.drop = true;
+                    if (!record.guidLeakDropLogged)
+                    {
+                        for (auto const& entry : record.guidRemap)
+                        {
+                            if (PacketContainsGuid(packet.packet, entry.first))
+                            {
+                                LOG_ERROR("modules", "ArenaReplay: GUID leak detected, dropping packet replay {} opcode {} size {} ts {} guid {}",
+                                    record.replayId,
+                                    packet.packet.GetOpcode(),
+                                    packet.packet.size(),
+                                    packet.timestamp,
+                                    entry.first);
+                                record.guidLeakDropLogged = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 continue;
             }
 
             for (auto const& entry : record.guidRemap)
                 ReplaceGuidInPacket(packet.packet, entry.first, entry.second, &objectTypes);
+
+            if (PacketContainsAnyOriginalGuid(packet.packet, record.guidRemap))
+            {
+                packet.drop = true;
+                if (!record.guidLeakDropLogged)
+                {
+                    for (auto const& entry : record.guidRemap)
+                    {
+                        if (PacketContainsGuid(packet.packet, entry.first))
+                        {
+                            LOG_ERROR("modules", "ArenaReplay: GUID leak detected, dropping packet replay {} opcode {} size {} ts {} guid {}",
+                                record.replayId,
+                                packet.packet.GetOpcode(),
+                                packet.packet.size(),
+                                packet.timestamp,
+                                entry.first);
+                            record.guidLeakDropLogged = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1885,6 +1980,19 @@ public:
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
+            if (packetRecord.drop || packetRecord.packet.size() == 0)
+            {
+                if (match.debugPacketsLogged < 50)
+                {
+                    LOG_INFO("modules", "ArenaReplay: dropping packet opcode {} size {} ts {}",
+                        packetRecord.packet.GetOpcode(),
+                        packetRecord.packet.size(),
+                        packetRecord.timestamp);
+                    ++match.debugPacketsLogged;
+                }
+                match.packets.pop_front();
+                continue;
+            }
             if (observerIsParticipant && packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == observerGhostGuid)
             {
                 if (match.debugPacketsLogged < 50)

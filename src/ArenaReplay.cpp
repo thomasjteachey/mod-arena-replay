@@ -2949,8 +2949,9 @@ private:
         CloseGossipMenuFor(player);
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
+        BattlegroundQueueTypeId queueTypeId = bg->GetQueueId();
 
-        uint32 queueSlot = player->AddBattlegroundQueueId(bgTypeId);
+        uint32 queueSlot = player->AddBattlegroundQueueId(queueTypeId);
 
         player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, teamId);
         player->SetEntryPoint();

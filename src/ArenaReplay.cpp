@@ -2916,7 +2916,6 @@ private:
 
         bgReplayIds[bg->GetInstanceID()] = player->GetGUID().GetCounter();
         player->SetPendingSpectatorForBG(bg->GetInstanceID());
-        bg->StartBattleground();
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
 
@@ -2928,6 +2927,7 @@ private:
         player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, TEAM_NEUTRAL);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
+        bg->StartBattleground();
         sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0, bg->GetStartTime(), bg->GetArenaType(), teamId);
         player->GetSession()->SendPacket(&data);
         handler.PSendSysMessage("Replay ID {} begins.", replayId);

@@ -114,6 +114,8 @@ namespace
 {
     bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid, std::unordered_map<uint64, uint8>* objectTypes = nullptr);
     bool PacketContainsGuid(WorldPacket const& packet, uint64 guid);
+    bool Decompress(std::vector<uint8> const& input, std::vector<uint8>& output);
+    bool Compress(std::vector<uint8> const& input, std::vector<uint8>& output);
     template <typename T>
     bool ReadLittleEndian(std::vector<uint8> const& data, size_t& offset, T& value);
     template <typename T>
@@ -248,7 +250,7 @@ namespace
     };
 
     constexpr std::array<uint16, 1> GAMEOBJECT_GUID_FIELDS_LOW = {
-        GAMEOBJECT_FIELD_CREATED_BY
+        OBJECT_FIELD_CREATED_BY
     };
 
     constexpr std::array<uint16, 1> DYNAMICOBJECT_GUID_FIELDS_LOW = {
@@ -1848,7 +1850,7 @@ public:
             records[bg->GetInstanceID()].packets.clear();
         MatchRecord& record = records[bg->GetInstanceID()];
 
-        if (IsClientOpcode(packet.GetOpcode()))
+        if (IsClientOpcode(static_cast<Opcodes>(packet.GetOpcode())))
         {
             if (!record.invalidOpcodeLogged)
             {

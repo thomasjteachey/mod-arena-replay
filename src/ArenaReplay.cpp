@@ -93,6 +93,7 @@ struct MatchRecord {
     std::deque<PacketRecord> packets;
     std::vector<uint64> participantGuids;
     std::unordered_map<uint64, uint64> guidRemap;
+    bool observerJoined = false;
     bool debugLoggedStart = false;
     size_t debugPacketsLogged = 0;
     size_t sentPackets = 0;
@@ -1944,8 +1945,11 @@ public:
             match.debugLoggedStart = true;
         }
 
+        if (!bg->GetPlayers().empty())
+            match.observerJoined = true;
+
         // if replay ends or spectator left > free arena replay data and/or kick player
-        if (match.packets.empty() || bg->GetPlayers().empty())
+        if (match.packets.empty() || (match.observerJoined && bg->GetPlayers().empty()))
         {
             loadedReplays.erase(it);
 

@@ -84,7 +84,7 @@ SMSG_PLAY_SPELL_VISUAL
 CMSG_ATTACKSWING
 CMSG_ATTACKSTOP*/
 
-struct PacketRecord { uint32 timestamp; WorldPacket packet; uint64 sourceGuid = 0; };
+struct PacketRecord { uint32 timestamp; WorldPacket packet; uint64 sourceGuid = 0; bool drop = false; };
 struct MatchRecord {
     BattlegroundTypeId typeId;
     uint8 arenaTypeId;
@@ -101,6 +101,7 @@ struct MatchRecord {
     bool invalidSendOpcodeLogged = false;
     bool updateObjectParseWarningLogged = false;
     bool updateObjectLeakLogged = false;
+    bool guidLeakDropLogged = false;
     size_t updateObjectParseLogs = 0;
 };
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
@@ -111,7 +112,7 @@ std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
 
 namespace
 {
-    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid);
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid, std::unordered_map<uint64, uint8>* objectTypes = nullptr);
     bool PacketContainsGuid(WorldPacket const& packet, uint64 guid);
 
     std::array<uint8, 8> GetGuidBytes(uint64 guid)
@@ -240,9 +241,32 @@ namespace
     constexpr std::array<uint16, 1> PLAYER_GUID_FIELDS_LOW = {
         PLAYER_FARSIGHT
     };
+
+    constexpr std::array<uint16, 1> GAMEOBJECT_GUID_FIELDS_LOW = {
+        GAMEOBJECT_FIELD_CREATED_BY
+    };
+
+    constexpr std::array<uint16, 1> DYNAMICOBJECT_GUID_FIELDS_LOW = {
+        DYNAMICOBJECT_CASTER
+    };
+
+    constexpr std::array<uint16, 1> CORPSE_GUID_FIELDS_LOW = {
+        CORPSE_FIELD_OWNER
+    };
+
+    constexpr std::array<uint16, 4> ITEM_GUID_FIELDS_LOW = {
+        ITEM_FIELD_OWNER,
+        ITEM_FIELD_CONTAINED,
+        ITEM_FIELD_CREATOR,
+        ITEM_FIELD_GIFTCREATOR
+    };
 #else
     constexpr std::array<uint16, 0> UNIT_GUID_FIELDS_LOW = {};
     constexpr std::array<uint16, 0> PLAYER_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> GAMEOBJECT_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> DYNAMICOBJECT_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> CORPSE_GUID_FIELDS_LOW = {};
+    constexpr std::array<uint16, 0> ITEM_GUID_FIELDS_LOW = {};
 #endif
 
     constexpr uint32 MOVEFLAG_ONTRANSPORT = 0x00000200;
@@ -259,6 +283,18 @@ namespace
 
         if (objectTypeId == static_cast<uint8>(TypeId::Player))
             return std::find(PLAYER_GUID_FIELDS_LOW.begin(), PLAYER_GUID_FIELDS_LOW.end(), fieldIndex) != PLAYER_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::GameObject))
+            return std::find(GAMEOBJECT_GUID_FIELDS_LOW.begin(), GAMEOBJECT_GUID_FIELDS_LOW.end(), fieldIndex) != GAMEOBJECT_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::DynamicObject))
+            return std::find(DYNAMICOBJECT_GUID_FIELDS_LOW.begin(), DYNAMICOBJECT_GUID_FIELDS_LOW.end(), fieldIndex) != DYNAMICOBJECT_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::Corpse))
+            return std::find(CORPSE_GUID_FIELDS_LOW.begin(), CORPSE_GUID_FIELDS_LOW.end(), fieldIndex) != CORPSE_GUID_FIELDS_LOW.end();
+
+        if (objectTypeId == static_cast<uint8>(TypeId::Item) || objectTypeId == static_cast<uint8>(TypeId::Container))
+            return std::find(ITEM_GUID_FIELDS_LOW.begin(), ITEM_GUID_FIELDS_LOW.end(), fieldIndex) != ITEM_GUID_FIELDS_LOW.end();
 
         return false;
     }
@@ -446,11 +482,14 @@ namespace
         for (size_t i = 0; i < fields.size(); ++i)
         {
             uint16 fieldIndex = fields[i];
+            bool isGuidField = objectTypeId != 0xFF && IsGuidLowField(fieldIndex, objectTypeId);
             uint32 lowValue = 0;
             if (!ReadLittleEndian(input, offset, lowValue))
                 return false;
 
             bool hasHigh = (i + 1) < fields.size() && fields[i + 1] == static_cast<uint16>(fieldIndex + 1);
+            if (remap && isGuidField && !hasHigh)
+                return false;
             if (hasHigh)
             {
                 uint32 highValue = 0;
@@ -459,7 +498,6 @@ namespace
 
                 uint64 guid = (uint64(highValue) << 32) | lowValue;
                 uint64 finalGuid = guid;
-                bool isGuidField = objectTypeId != 0xFF && IsGuidLowField(fieldIndex, objectTypeId);
                 if (isGuidField && remap)
                 {
                     auto it = remap->find(guid);
@@ -467,8 +505,16 @@ namespace
                         finalGuid = it->second;
                 }
 
-                if (extracted && guid != 0 && isGuidField)
-                    extracted->insert(guid);
+                if (extracted && guid != 0)
+                {
+                    if (isGuidField)
+                        extracted->insert(guid);
+                    else if (!remap && objectTypeId == 0xFF)
+                    {
+                        if (guid > 0xFFFFull && GetPackedMask(guid) != 0)
+                            extracted->insert(guid);
+                    }
+                }
 
                 uint32 finalLow = static_cast<uint32>(finalGuid & 0xFFFFFFFFu);
                 uint32 finalHigh = static_cast<uint32>((finalGuid >> 32) & 0xFFFFFFFFu);
@@ -600,6 +646,381 @@ namespace
         }
 
         return modified;
+    }
+
+    bool SkipBytes(std::vector<uint8> const& input, size_t& offset, size_t count)
+    {
+        if (offset + count > input.size())
+            return false;
+
+        offset += count;
+        return true;
+    }
+
+    bool ProcessUpdateObjectPayload(std::vector<uint8> const& input, std::vector<uint8>* output,
+        std::unordered_map<uint64, uint64> const* remap, std::unordered_set<uint64>* extracted,
+        std::unordered_map<uint64, uint8>* objectTypes, UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        size_t offset = 0;
+        std::vector<uint8> scratchOutput;
+        auto writeByte = [&](uint8 value)
+        {
+            if (output)
+                output->push_back(value);
+        };
+
+        uint32 blockCount = 0;
+        if (!ReadLittleEndian(input, offset, blockCount))
+        {
+            failureOffset = offset;
+            return false;
+        }
+
+        stats.blockCount = blockCount;
+        if (output)
+            WriteLittleEndian(*output, blockCount);
+
+        uint8 transportFlag = 0;
+        if (!ReadLittleEndian(input, offset, transportFlag))
+        {
+            failureOffset = offset;
+            return false;
+        }
+        writeByte(transportFlag);
+
+        for (uint32 blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+        {
+            uint8 updateTypeValue = 0;
+            if (!ReadLittleEndian(input, offset, updateTypeValue))
+            {
+                failureOffset = offset;
+                return false;
+            }
+            writeByte(updateTypeValue);
+
+            UpdateType updateType = static_cast<UpdateType>(updateTypeValue);
+            if (updateType == UpdateType::OutOfRange)
+            {
+                uint32 guidCount = 0;
+                if (output)
+                {
+                    if (!ReadAndWrite(input, offset, *output, guidCount))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!ReadLittleEndian(input, offset, guidCount))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+
+                for (uint32 i = 0; i < guidCount; ++i)
+                {
+                    uint64 guid = 0;
+                    std::vector<uint8> packed;
+                    if (!ReadPackedGuid(input, offset, guid, output ? &packed : nullptr))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+
+                    if (extracted && guid != 0)
+                        extracted->insert(guid);
+
+                    uint64 finalGuid = guid;
+                    if (remap)
+                    {
+                        auto it = remap->find(guid);
+                        if (it != remap->end())
+                            finalGuid = it->second;
+                    }
+
+                    if (output)
+                    {
+                        if (finalGuid != guid)
+                            WritePackedGuid(*output, finalGuid);
+                        else if (!packed.empty())
+                            output->insert(output->end(), packed.begin(), packed.end());
+                        else
+                            output->push_back(0);
+                    }
+                }
+
+                ++stats.parsedBlocks;
+                continue;
+            }
+
+            uint64 objectGuid = 0;
+            std::vector<uint8> packedGuid;
+            if (!ReadPackedGuid(input, offset, objectGuid, output ? &packedGuid : nullptr))
+            {
+                failureOffset = offset;
+                return false;
+            }
+
+            if (extracted && objectGuid != 0)
+                extracted->insert(objectGuid);
+
+            uint64 finalGuid = objectGuid;
+            if (remap)
+            {
+                auto it = remap->find(objectGuid);
+                if (it != remap->end())
+                    finalGuid = it->second;
+            }
+
+            if (output)
+            {
+                if (finalGuid != objectGuid)
+                    WritePackedGuid(*output, finalGuid);
+                else if (!packedGuid.empty())
+                    output->insert(output->end(), packedGuid.begin(), packedGuid.end());
+                else
+                    output->push_back(0);
+            }
+
+            if (updateType == UpdateType::CreateObject || updateType == UpdateType::CreateObject2)
+            {
+                uint8 objectTypeId = 0;
+                if (output)
+                {
+                    if (!ReadAndWrite(input, offset, *output, objectTypeId))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!ReadLittleEndian(input, offset, objectTypeId))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+
+                if (objectTypes)
+                    (*objectTypes)[finalGuid] = objectTypeId;
+
+                if (output)
+                {
+                    if (!CopyMovementBlock(input, offset, *output, remap, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!CopyMovementBlock(input, offset, scratchOutput, nullptr, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+
+                if (output)
+                {
+                    if (!CopyUpdateMaskAndValues(input, offset, *output, remap, objectTypeId, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!CopyUpdateMaskAndValues(input, offset, scratchOutput, nullptr, objectTypeId, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+            }
+            else if (updateType == UpdateType::Values)
+            {
+                uint8 objectTypeId = 0xFF;
+                if (objectTypes)
+                {
+                    auto typeIt = objectTypes->find(finalGuid);
+                    if (typeIt != objectTypes->end())
+                        objectTypeId = typeIt->second;
+                }
+
+                if (output)
+                {
+                    if (!CopyUpdateMaskAndValues(input, offset, *output, remap, objectTypeId, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!CopyUpdateMaskAndValues(input, offset, scratchOutput, nullptr, objectTypeId, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+            }
+            else if (updateType == UpdateType::Movement)
+            {
+                if (output)
+                {
+                    if (!CopyMovementBlock(input, offset, *output, remap, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!CopyMovementBlock(input, offset, scratchOutput, nullptr, extracted))
+                    {
+                        failureOffset = offset;
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                failureOffset = offset;
+                return false;
+            }
+
+            ++stats.parsedBlocks;
+        }
+
+        stats.bytesConsumed = offset;
+        if (offset != input.size())
+        {
+            failureOffset = offset;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool RewriteUpdateObjectPacket(WorldPacket& packet, std::unordered_map<uint64, uint64> const& remap,
+        std::unordered_map<uint64, uint8>& objectTypes, UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> input(contents, contents + packetSize);
+        std::vector<uint8> output;
+        output.reserve(input.size());
+
+        if (!ProcessUpdateObjectPayload(input, &output, &remap, nullptr, &objectTypes, stats, failureOffset))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), output.size());
+        if (!output.empty())
+            updated.append(output.data(), output.size());
+
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool RewriteCompressedUpdateObjectPacket(WorldPacket& packet, std::unordered_map<uint64, uint64> const& remap,
+        std::unordered_map<uint64, uint8>& objectTypes, UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return false;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return false;
+
+        std::vector<uint8> input(contents, contents + packetSize);
+        std::vector<uint8> decompressed;
+
+        if (!Decompress(input, decompressed))
+            return false;
+
+        std::vector<uint8> rewritten;
+        rewritten.reserve(decompressed.size());
+        if (!ProcessUpdateObjectPayload(decompressed, &rewritten, &remap, nullptr, &objectTypes, stats, failureOffset))
+            return false;
+
+        std::vector<uint8> recompressed;
+        if (!Compress(rewritten, recompressed))
+            return false;
+
+        WorldPacket updated(packet.GetOpcode(), recompressed.size());
+        if (!recompressed.empty())
+            updated.append(recompressed.data(), recompressed.size());
+
+        packet = std::move(updated);
+        return true;
+    }
+
+    bool ExtractGuidsFromUpdateObjectPayload(std::vector<uint8> const& input, std::unordered_set<uint64>& guids,
+        UpdateObjectParseStats& stats, size_t& failureOffset)
+    {
+        return ProcessUpdateObjectPayload(input, nullptr, nullptr, &guids, nullptr, stats, failureOffset);
+    }
+
+    bool ExtractGuidsFromPacket(WorldPacket const& packet, std::unordered_set<uint64>& guids, UpdateObjectParseStats& stats,
+        size_t& failureOffset)
+    {
+        size_t packetSize = packet.size();
+        if (packetSize == 0)
+            return true;
+
+        uint8 const* contents = packet.contents();
+        if (!contents)
+            return true;
+
+        std::vector<uint8> buffer(contents, contents + packetSize);
+        if (packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
+        {
+            std::vector<uint8> decompressed;
+            if (!Decompress(buffer, decompressed))
+                return false;
+
+            return ExtractGuidsFromUpdateObjectPayload(decompressed, guids, stats, failureOffset);
+        }
+
+        if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
+            return ExtractGuidsFromUpdateObjectPayload(buffer, guids, stats, failureOffset);
+
+        if (packet.GetOpcode() == SMSG_DESTROY_OBJECT)
+        {
+            size_t offset = 0;
+            uint64 guid = 0;
+            std::vector<uint8> packed;
+            if (ReadPackedGuid(buffer, offset, guid, &packed))
+            {
+                if (guid != 0)
+                    guids.insert(guid);
+                return true;
+            }
+
+            offset = 0;
+            if (offset + sizeof(uint64) <= buffer.size())
+            {
+                std::array<uint8, 8> bytes{};
+                for (size_t i = 0; i < bytes.size(); ++i)
+                    bytes[i] = buffer[offset + i];
+                guid = BuildGuidFromBytes(bytes);
+                if (guid != 0)
+                    guids.insert(guid);
+            }
+        }
+
+        return true;
     }
 
     bool SkipBytes(std::vector<uint8> const& input, size_t& offset, size_t count)
@@ -1195,7 +1616,7 @@ namespace
         return false;
     }
 
-    bool RewriteMultipacketPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    bool RewriteMultipacketPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid, std::unordered_map<uint64, uint8>* objectTypes)
     {
         size_t packetSize = packet.size();
         if (packetSize == 0)
@@ -1235,7 +1656,7 @@ namespace
 
                     bool modified = false;
                     for (WorldPacket& embedded : embeddedPackets)
-                        modified |= ReplaceGuidInPacket(embedded, fromGuid, toGuid);
+                        modified |= ReplaceGuidInPacket(embedded, fromGuid, toGuid, objectTypes);
 
                     if (!modified)
                         continue;
@@ -1524,26 +1945,42 @@ namespace
         return ContainsGuidSequences(buffer, guid, true);
     }
 
-    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid)
+    bool PacketContainsAnyOriginalGuid(WorldPacket const& packet, std::unordered_map<uint64, uint64> const& guidRemap)
+    {
+        for (auto const& entry : guidRemap)
+        {
+            uint64 original = entry.first;
+            if (original == 0)
+                continue;
+
+            if (PacketContainsGuid(packet, original))
+                return true;
+        }
+
+        return false;
+    }
+
+    bool ReplaceGuidInPacket(WorldPacket& packet, uint64 fromGuid, uint64 toGuid, std::unordered_map<uint64, uint8>* objectTypes)
     {
         if (fromGuid == toGuid)
             return false;
 
         if (packet.GetOpcode() == SMSG_MULTIPLE_PACKETS)
         {
-            if (RewriteMultipacketPacket(packet, fromGuid, toGuid))
+            if (RewriteMultipacketPacket(packet, fromGuid, toGuid, objectTypes))
                 return true;
         }
 
         if (packet.GetOpcode() == SMSG_UPDATE_OBJECT || packet.GetOpcode() == SMSG_COMPRESSED_UPDATE_OBJECT)
         {
             std::unordered_map<uint64, uint64> remap{ { fromGuid, toGuid } };
-            std::unordered_map<uint64, uint8> objectTypes;
+            std::unordered_map<uint64, uint8> localTypes;
+            std::unordered_map<uint64, uint8>& typesRef = objectTypes ? *objectTypes : localTypes;
             UpdateObjectParseStats stats;
             size_t failureOffset = 0;
             if (packet.GetOpcode() == SMSG_UPDATE_OBJECT)
-                return RewriteUpdateObjectPacket(packet, remap, objectTypes, stats, failureOffset);
-            return RewriteCompressedUpdateObjectPacket(packet, remap, objectTypes, stats, failureOffset);
+                return RewriteUpdateObjectPacket(packet, remap, typesRef, stats, failureOffset);
+            return RewriteCompressedUpdateObjectPacket(packet, remap, typesRef, stats, failureOffset);
         }
 
         return RewriteRawPacket(packet, fromGuid, toGuid);
@@ -1683,11 +2120,55 @@ namespace
                     record.updateObjectParseWarningLogged = true;
                 }
 
+                if (PacketContainsAnyOriginalGuid(packet.packet, record.guidRemap))
+                {
+                    packet.drop = true;
+                    if (!record.guidLeakDropLogged)
+                    {
+                        for (auto const& entry : record.guidRemap)
+                        {
+                            if (PacketContainsGuid(packet.packet, entry.first))
+                            {
+                                LOG_ERROR("modules", "ArenaReplay: GUID leak detected, dropping packet replay {} opcode {} size {} ts {} guid {}",
+                                    record.replayId,
+                                    packet.packet.GetOpcode(),
+                                    packet.packet.size(),
+                                    packet.timestamp,
+                                    entry.first);
+                                record.guidLeakDropLogged = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 continue;
             }
 
             for (auto const& entry : record.guidRemap)
-                ReplaceGuidInPacket(packet.packet, entry.first, entry.second);
+                ReplaceGuidInPacket(packet.packet, entry.first, entry.second, &objectTypes);
+
+            if (PacketContainsAnyOriginalGuid(packet.packet, record.guidRemap))
+            {
+                packet.drop = true;
+                if (!record.guidLeakDropLogged)
+                {
+                    for (auto const& entry : record.guidRemap)
+                    {
+                        if (PacketContainsGuid(packet.packet, entry.first))
+                        {
+                            LOG_ERROR("modules", "ArenaReplay: GUID leak detected, dropping packet replay {} opcode {} size {} ts {} guid {}",
+                                record.replayId,
+                                packet.packet.GetOpcode(),
+                                packet.packet.size(),
+                                packet.timestamp,
+                                entry.first);
+                            record.guidLeakDropLogged = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1874,6 +2355,19 @@ public:
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
+            if (packetRecord.drop || packetRecord.packet.size() == 0)
+            {
+                if (match.debugPacketsLogged < 50)
+                {
+                    LOG_INFO("modules", "ArenaReplay: dropping packet opcode {} size {} ts {}",
+                        packetRecord.packet.GetOpcode(),
+                        packetRecord.packet.size(),
+                        packetRecord.timestamp);
+                    ++match.debugPacketsLogged;
+                }
+                match.packets.pop_front();
+                continue;
+            }
             if (observerIsParticipant && packetRecord.sourceGuid != 0 && packetRecord.sourceGuid == observerGhostGuid)
             {
                 if (match.debugPacketsLogged < 50)

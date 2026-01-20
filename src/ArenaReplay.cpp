@@ -2953,6 +2953,7 @@ private:
 
         uint32 queueSlot = player->AddBattlegroundQueueId(queueTypeId);
 
+        TeamId teamId = Player::TeamIdForRace(player->getRace());
         player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, teamId);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);

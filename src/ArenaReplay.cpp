@@ -103,11 +103,12 @@ struct MatchRecord {
     bool updateObjectParseWarningLogged = false;
     bool updateObjectLeakLogged = false;
     bool guidLeakDropLogged = false;
+    bool updateLogged = false;
     size_t updateObjectParseLogs = 0;
 };
 struct BgPlayersGuids { std::string alliancePlayerGuids; std::string hordePlayerGuids; };
 std::unordered_map<uint32, MatchRecord> records;
-std::unordered_map<uint64, MatchRecord> loadedReplays;
+std::unordered_map<uint32, MatchRecord> loadedReplays;
 std::unordered_map<uint32, uint32> bgReplayIds;
 std::unordered_map<uint32, BgPlayersGuids> bgPlayersGuids;
 
@@ -1944,20 +1945,28 @@ public:
                 bg->GetStartTime());
             match.debugLoggedStart = true;
         }
+        if (!match.updateLogged)
+        {
+            LOG_INFO("modules", "ArenaReplay: update bgInstance {} matchId {} players {} packets {}",
+                bg->GetInstanceID(),
+                replayId,
+                bg->GetPlayers().size(),
+                match.packets.size());
+            match.updateLogged = true;
+        }
 
         if (!bg->GetPlayers().empty())
             match.observerJoined = true;
 
-        // if replay ends or spectator left > free arena replay data and/or kick player
-        if (match.packets.empty() || (match.observerJoined && bg->GetPlayers().empty()))
+        if (match.packets.empty())
         {
             loadedReplays.erase(it);
-
-            if (!bg->GetPlayers().empty())
-                bg->GetPlayers().begin()->second->LeaveBattleground(bg);
-
+            bgReplayIds.erase(bg->GetInstanceID());
             return;
         }
+
+        if (bg->GetPlayers().empty())
+            return;
 
         //send replay data to spectator
         const uint64 observerRealGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
@@ -2904,7 +2913,7 @@ private:
             return false;
         }
 
-        MatchRecord record = loadedReplays[player->GetGUID().GetCounter()];
+        MatchRecord const& record = loadedReplays.at(replayId);
 
         Battleground* bg = sBattlegroundMgr->CreateNewBattleground(record.typeId, GetBattlegroundBracketByLevel(record.mapId, sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)), record.arenaTypeId, false);
         if (!bg)
@@ -2914,9 +2923,8 @@ private:
             return false;
         }
 
-        bgReplayIds[bg->GetInstanceID()] = player->GetGUID().GetCounter();
+        bgReplayIds[bg->GetInstanceID()] = replayId;
         player->SetPendingSpectatorForBG(bg->GetInstanceID());
-        bg->StartBattleground();
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
 
@@ -2928,6 +2936,7 @@ private:
         player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, TEAM_NEUTRAL);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);
+        bg->StartBattleground();
         sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0, bg->GetStartTime(), bg->GetArenaType(), teamId);
         player->GetSession()->SendPacket(&data);
         handler.PSendSysMessage("Replay ID {} begins.", replayId);
@@ -2970,7 +2979,7 @@ private:
 
         RemapReplayGuids(record);
 
-        loadedReplays[p->GetGUID().GetCounter()] = std::move(record);
+        loadedReplays[matchId] = std::move(record);
         return true;
     }
 

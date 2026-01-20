@@ -2949,7 +2949,7 @@ private:
         CloseGossipMenuFor(player);
 
         BattlegroundTypeId bgTypeId = bg->GetBgTypeID();
-        BattlegroundQueueTypeId queueTypeId = bg->GetQueueId();
+        BattlegroundQueueTypeId queueTypeId = BattlegroundMgr::BGQueueTypeId(bgTypeId, bg->GetArenaType());
 
         uint32 queueSlot = player->AddBattlegroundQueueId(queueTypeId);
 

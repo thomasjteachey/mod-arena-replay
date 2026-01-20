@@ -2096,8 +2096,7 @@ public:
                 bg->GetInstanceID(),
                 player->GetGUID().GetRawValue(),
                 replayIt->second);
-            if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
-                bg->StartBattleground();
+            // BG was already registered; do not StartBattleground() here.
             return;
         }
 
@@ -2945,6 +2944,16 @@ private:
         }
 
         bgReplayIds[bg->GetInstanceID()] = replayId;
+
+        TeamId teamId = Player::TeamIdForRace(player->getRace());
+        bg->IncreaseInvitedCount(teamId);
+        sBattlegroundMgr->AddBattleground(bg);
+        LOG_INFO("modules", "ArenaReplay: registered replay bgInstance {} for replay {} (type {} arenaType {})",
+            bg->GetInstanceID(),
+            replayId,
+            uint32(bg->GetBgTypeID()),
+            uint32(bg->GetArenaType()));
+
         player->SetPendingSpectatorForBG(bg->GetInstanceID());
         CloseGossipMenuFor(player);
 
@@ -2953,7 +2962,6 @@ private:
 
         uint32 queueSlot = player->AddBattlegroundQueueId(queueTypeId);
 
-        TeamId teamId = Player::TeamIdForRace(player->getRace());
         player->SetBattlegroundId(bg->GetInstanceID(), bgTypeId, queueSlot, true, false, teamId);
         player->SetEntryPoint();
         sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bgTypeId);

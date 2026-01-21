@@ -1924,7 +1924,7 @@ public:
             bg->SetStartTime(bg->GetStartTime() + (startDelayTime - 1000));
         }
 
-        if (bg->GetStatus() != BattlegroundStatus::STATUS_IN_PROGRESS)
+        if (bg->GetStatus() == BattlegroundStatus::STATUS_WAIT_LEAVE)
             return;
 
         // retrieve arena replay data
@@ -1945,24 +1945,28 @@ public:
                 bg->GetStartTime());
             match.debugLoggedStart = true;
         }
+        auto const& spectators = bg->GetSpectators();
         if (!match.updateLogged)
         {
-            LOG_INFO("modules", "ArenaReplay: update bgInstance {} matchId {} players {} packets {}",
+            LOG_INFO("modules", "ArenaReplay: update bgInstance {} status {} players {} spectators {} startTime {} packetsLeft {}",
                 bg->GetInstanceID(),
-                replayId,
+                int(bg->GetStatus()),
                 bg->GetPlayers().size(),
+                spectators.size(),
+                bg->GetStartTime(),
                 match.packets.size());
             match.updateLogged = true;
         }
 
-        if (!bg->GetPlayers().empty())
+        if (!spectators.empty() || !bg->GetPlayers().empty())
         {
             if (!match.observerJoined)
             {
-                LOG_INFO("modules", "ArenaReplay: observer joined bgInstance {} matchId {} players {}",
+                LOG_INFO("modules", "ArenaReplay: observer joined bgInstance {} matchId {} players {} spectators {}",
                     bg->GetInstanceID(),
                     replayId,
-                    bg->GetPlayers().size());
+                    bg->GetPlayers().size(),
+                    spectators.size());
             }
             match.observerJoined = true;
         }
@@ -1974,11 +1978,20 @@ public:
             return;
         }
 
-        if (bg->GetPlayers().empty())
+        if (spectators.empty() && bg->GetPlayers().empty())
             return;
 
         //send replay data to spectator
-        const uint64 observerRealGuid = bg->GetPlayers().empty() ? 0 : bg->GetPlayers().begin()->second->GetGUID().GetRawValue();
+        Player* observer = nullptr;
+        if (!spectators.empty())
+            observer = *spectators.begin();
+        else
+            observer = bg->GetPlayers().begin()->second;
+
+        if (!observer)
+            return;
+
+        const uint64 observerRealGuid = observer->GetGUID().GetRawValue();
         bool observerIsParticipant = false;
         uint64 observerGhostGuid = observerRealGuid;
         auto remapIt = match.guidRemap.find(observerRealGuid);
@@ -2005,7 +2018,7 @@ public:
 
         while (!match.packets.empty() && match.packets.front().timestamp <= bg->GetStartTime())
         {
-            if (bg->GetPlayers().empty())
+            if (spectators.empty() && bg->GetPlayers().empty())
                 break;
 
             PacketRecord const& packetRecord = match.packets.front();
@@ -2067,7 +2080,6 @@ public:
             }
 
             WorldPacket const* myPacket = &packetRecord.packet;
-            Player* replayer = bg->GetPlayers().begin()->second;
             if (match.debugPacketsLogged < 50)
             {
                 LOG_INFO("modules", "ArenaReplay: sending packet opcode {} size {} ts {} sourceGuid {} to observer guid {}",
@@ -2078,7 +2090,27 @@ public:
                     observerRealGuid);
                 ++match.debugPacketsLogged;
             }
-            replayer->GetSession()->SendPacket(myPacket);
+            if (!spectators.empty())
+            {
+                for (Player* spectator : spectators)
+                {
+                    if (!spectator || !spectator->GetSession())
+                        continue;
+
+                    spectator->GetSession()->SendPacket(myPacket);
+                }
+            }
+            else
+            {
+                for (auto const& playerPair : bg->GetPlayers())
+                {
+                    Player* player = playerPair.second;
+                    if (!player || !player->GetSession())
+                        continue;
+
+                    player->GetSession()->SendPacket(myPacket);
+                }
+            }
             ++match.sentPackets;
             match.packets.pop_front();
         }
@@ -2948,6 +2980,8 @@ private:
         TeamId teamId = Player::TeamIdForRace(player->getRace());
         bg->IncreaseInvitedCount(teamId);
         sBattlegroundMgr->AddBattleground(bg);
+        bg->SetStartDelayTime(0);
+        bg->SetStartTime(0);
         LOG_INFO("modules", "ArenaReplay: registered replay bgInstance {} for replay {} (type {} arenaType {})",
             bg->GetInstanceID(),
             replayId,
